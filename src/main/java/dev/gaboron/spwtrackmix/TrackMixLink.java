@@ -10,8 +10,11 @@ import java.util.Map;
 
 public final class TrackMixLink implements AutoCloseable {
     private static final ObjectName MIXER = name("dev.gaboron.spwtrackmix:type=Mixer,version=1");
-    private static final ObjectName AMLL_PAGE = name("io.github.gaboron.amllspw:type=RebuiltPlayer,version=1");
+    private static final ObjectName AMLL_PAGE = name("io.github.gaboron.amllspw:type=RebuiltPlayer,version=2");
+    private static final ObjectName LEGACY_PAGE = name("io.github.gaboron.amllspw:type=RebuiltPlayer,version=1");
     private final MBeanServer server = ManagementFactory.getPlatformMBeanServer();
+    private final AmllPlayerRegistration extensions;
+    private boolean closed;
 
     public interface Mixer {
         Map<String, Object> getState();
@@ -23,6 +26,16 @@ public final class TrackMixLink implements AutoCloseable {
     TrackMixLink(TrackMixSession session) {
         try {
             server.registerMBean(new StandardMBean(new Controls(session), Mixer.class, false), MIXER);
+            try {
+                extensions = new AmllPlayerRegistration(server, session);
+            } catch (JMException | RuntimeException error) {
+                try {
+                    server.unregisterMBean(MIXER);
+                } catch (JMException rollback) {
+                    error.addSuppressed(rollback);
+                }
+                throw error;
+            }
         } catch (JMException error) {
             throw new IllegalStateException("无法注册六轨联动接口", error);
         }
@@ -30,16 +43,24 @@ public final class TrackMixLink implements AutoCloseable {
 
     static boolean amllRebuildsPlayer() {
         try {
-            return Boolean.TRUE.equals(ManagementFactory.getPlatformMBeanServer().getAttribute(AMLL_PAGE, "Active"));
+            var server = ManagementFactory.getPlatformMBeanServer();
+            var endpoint = server.isRegistered(AMLL_PAGE) ? AMLL_PAGE : LEGACY_PAGE;
+            return Boolean.TRUE.equals(server.getAttribute(endpoint, "Active"));
         } catch (JMException unavailable) {
             return false;
         }
     }
 
     @Override
-    public void close() {
+    public synchronized void close() {
+        if (closed) return;
+        closed = true;
         try {
-            server.unregisterMBean(MIXER);
+            try {
+                extensions.close();
+            } finally {
+                server.unregisterMBean(MIXER);
+            }
         } catch (InstanceNotFoundException ignored) {
             // A stopped plugin may be closed again during an update.
         } catch (JMException error) {

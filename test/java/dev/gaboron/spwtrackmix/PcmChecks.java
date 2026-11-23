@@ -261,17 +261,7 @@ final class PcmChecks {
 
                 session.setMix(ignored -> mix);
                 try (var link = new TrackMixLink(session)) {
-                    var server = ManagementFactory.getPlatformMBeanServer();
-                    var name = new ObjectName("dev.gaboron.spwtrackmix:type=Mixer,version=1");
-                    server.invoke(name, "configure",
-                            new Object[]{preferences.cacheGiB(), preferences.quality(), preferences.cpu(), preferences.fp16()},
-                            new String[]{"int", "boolean", "boolean", "boolean"});
-                    var state = (Map<?, ?>) server.getAttribute(name, "State");
-                    var settings = (Map<?, ?>) state.get("settings");
-                    require(settings.get("cacheGiB").equals(24) && settings.get("fp16").equals(true),
-                            "AMLL settings did not read back");
-                    require(state.get("canQuick").equals(true) && ((List<?>) state.get("jobs")).isEmpty(),
-                            "AMLL separation actions or queue state missing");
+                    checkAmllPanel(anotherItem, preferences, session);
                 }
             }
 
@@ -308,6 +298,38 @@ final class PcmChecks {
         for (int lane = 0; lane < MixSettings.STEMS; lane++) {
             require(mix.effectiveVolume(lane) == 100, context + ": a fader retained its previous value");
         }
+    }
+
+    private static void checkAmllPanel(TrackMixSession.Track track, TrackMixOptions preferences, TrackMixSession session)
+            throws Exception {
+        var server = ManagementFactory.getPlatformMBeanServer();
+        var name = new ObjectName("io.github.gaboron.amllspw:type=PlayerPanel,version=1,provider=dev.gaboron.spwtrackmix");
+        var spectrum = new ObjectName("io.github.gaboron.amllspw:type=SpectrumSource,version=1,provider=dev.gaboron.spwtrackmix");
+        var context = Map.of("trackId", track.id(), "path", track.path().toString());
+        var render = new String[]{"java.lang.String", "java.util.Map"};
+        var edit = new String[]{"java.lang.String", "java.util.Map", "java.lang.String", "int"};
+        var descriptor = (Map<?, ?>) server.getAttribute(name, "Descriptor");
+        require(descriptor.get("label").equals("六轨混音") && ((String) descriptor.get("svg")).contains("<svg"),
+                "the generic toolbar contribution did not include its icon");
+        var main = (List<?>) server.invoke(name, "render", new Object[]{"fixture", context}, render);
+        require(main.stream().anyMatch(row -> "quick".equals(((Map<?, ?>) row).get("action"))),
+                "generic panel did not offer quick separation for the selected track");
+        var stale = (List<?>) server.invoke(name, "render", new Object[]{"fixture",
+                Map.of("trackId", "previous", "path", track.path().toString())}, render);
+        require(stale.stream().noneMatch(row -> "quick".equals(((Map<?, ?>) row).get("action"))),
+                "a stale host selection exposed actions for a different track");
+
+        server.invoke(name, "action", new Object[]{"fixture", context, "settings", 0}, edit);
+        server.invoke(name, "action", new Object[]{"fixture", context, "cacheGiB", preferences.cacheGiB()}, edit);
+        server.invoke(name, "action", new Object[]{"fixture", context, "cpu", 0}, edit);
+        server.invoke(name, "action", new Object[]{"fixture", context, "fp16", 0}, edit);
+        server.invoke(name, "action", new Object[]{"fixture", context, "cpu", 0}, edit);
+        require(session.options().cacheGiB() == 23, "an uncommitted panel draft changed settings");
+        server.invoke(name, "action", new Object[]{"fixture", context, "save", 0}, edit);
+        require(session.options().equals(preferences), "the generic panel did not persist the requested preferences");
+        server.invoke(name, "close", new Object[]{"fixture"}, new String[]{"java.lang.String"});
+        require(server.invoke(spectrum, "spectrum", new Object[]{track.path().toString(), 0L},
+                new String[]{"java.lang.String", "long"}) == null, "inactive spectrum must fall back to original PCM");
     }
 
     private static void queueChecks() {

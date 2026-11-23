@@ -125,10 +125,15 @@ final class TrackMixSession implements AutoCloseable {
     }
 
     void setMix(UnaryOperator<MixSettings> change) {
+        setMix(null, change);
+    }
+
+    void setMix(Track expected, UnaryOperator<MixSettings> change) {
         synchronized (playbackLock) {
             Selection before = playback.selection;
             Selection current = refreshSelection();
-            if (before != null && current != null && before.track.sameSource(current.track)) {
+            if (before != null && current != null && before.track.sameSource(current.track)
+                    && (expected == null || current.track.sameSource(expected))) {
                 playback = new Playback(current, change.apply(playback.mix));
             }
         }
@@ -154,9 +159,14 @@ final class TrackMixSession implements AutoCloseable {
     }
 
     void separate(boolean quick) {
+        separate(null, quick);
+    }
+
+    void separate(Track expected, boolean quick) {
         Selection before = playback.selection;
         Selection selected = refreshSelection();
         if (before == null || selected == null || !before.track.sameSource(selected.track)
+                || (expected != null && !selected.track.sameSource(expected))
                 || selected.identity == null || (selected.entry != null && (quick || !selected.entry.quick()))) {
             return;
         }
@@ -180,8 +190,12 @@ final class TrackMixSession implements AutoCloseable {
     }
 
     void clearCurrent() {
-        Selection selected = playback.selection;
-        if (selected != null && selected.identity != null) {
+        clearCurrent(null);
+    }
+
+    void clearCurrent(Track expected) {
+        Selection selected = refreshSelection();
+        if (selected != null && selected.identity != null && (expected == null || selected.track.sameSource(expected))) {
             jobs.maintain(selected.track.title, task -> {
                 bypassCurrent();
                 cache.clear(selected.identity);

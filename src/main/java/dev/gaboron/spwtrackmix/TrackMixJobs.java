@@ -12,7 +12,25 @@ final class TrackMixJobs implements AutoCloseable {
 
     enum Kind { STANDARD, QUICK, MAINTENANCE }
 
-    record Progress(String stage, double fraction) {}
+    record Progress(String stage, double fraction) {
+        String label() {
+            String text = switch (stage) {
+                case "" -> "准备开始";
+                case "runtime" -> "准备本地推理环境";
+                case "download" -> "下载模型";
+                case "verify" -> "校验模型";
+                case "load" -> "载入模型";
+                case "decode" -> "解码原曲";
+                case "gpu32" -> "CUDA FP32 分离";
+                case "gpu16" -> "CUDA FP16 分离";
+                case "cpu" -> "CPU 分离";
+                case "fallback" -> "切换推理设备或精度";
+                case "finish", "cache", "done" -> "写入音轨缓存";
+                default -> "正在处理";
+            };
+            return fraction > 0.001 && fraction < 0.999 ? text + " " + Math.round(fraction * 100) + "%" : text;
+        }
+    }
     record Item(int id, String title, Kind kind, boolean running, boolean cancelling, Progress progress) {}
     record Snapshot(List<Item> items, boolean currentQueued, String notice) {}
 

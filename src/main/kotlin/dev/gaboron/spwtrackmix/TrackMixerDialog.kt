@@ -201,8 +201,7 @@ private fun SeparationQueue(queue: TrackMixJobs.Snapshot, cancel: (Int) -> Unit)
             val progress = when {
                 job.cancelling() -> "正在取消"
                 !job.running() -> "排队 · 第 $index 位"
-                fraction in 0.001..0.999 -> "${jobLabel(job.progress().stage())} ${(fraction * 100).roundToInt()}%"
-                else -> jobLabel(job.progress().stage())
+                else -> job.progress().label()
             }
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -293,18 +292,4 @@ private fun Toggle(text: String, enabled: Boolean, selected: Boolean, action: ()
         colors = colors.copy(containerColor = background, contentColor = foreground)) {
         Text(text, maxLines = 1, overflow = TextOverflow.Ellipsis)
     }
-}
-
-private fun jobLabel(stage: String): String = when (stage) {
-    "runtime" -> "准备本地推理环境"
-    "download" -> "下载模型"
-    "verify" -> "校验模型"
-    "load" -> "载入模型"
-    "decode" -> "解码原曲"
-    "gpu32" -> "CUDA FP32 分离"
-    "gpu16" -> "CUDA FP16 分离"
-    "cpu" -> "CPU 分离"
-    "fallback" -> "切换推理设备或精度"
-    "finish", "cache", "done" -> "写入六轨缓存"
-    else -> "准备开始"
 }
