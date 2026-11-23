@@ -20,11 +20,19 @@ import com.xuncorp.spw.workshop.api.hook.MethodHook
 import com.xuncorp.spw.workshop.api.hook.MethodHookParam
 import java.lang.invoke.MethodType
 import java.lang.reflect.Method
+import javax.swing.Timer
 
 /** Exact UI bindings for the same Steam host build as the PCM hook. */
 internal class TrackMixHostUi(private val session: TrackMixSession) : AutoCloseable {
     private val loader = WorkshopApi::class.java.classLoader
-    private val handles = ArrayList<HookHandle>(2)
+    private val handles = ArrayList<HookHandle>(1)
+    private var menuHook: HookHandle? = null
+    private var rebuildMode: Boolean? = null
+    private val menuWatch = Timer(350) {
+        runCatching(::syncMenu).onFailure {
+            System.getLogger(javaClass.name).log(System.Logger.Level.WARNING, "无法切换六轨菜单入口", it)
+        }
+    }
     private val theme = HostPalette(loader)
     val navigation = resolve(loader, "com.xuncorp.voxzen.ui.navigation.AppNavigationKt", "AppNavigation",
         "(Landroidx/compose/runtime/Composer;I)V")
@@ -55,33 +63,52 @@ internal class TrackMixHostUi(private val session: TrackMixSession) : AutoClosea
                     }
                 }
             }
-            handles += registry.hookMethod(builder.declaringClass.name, builder.name,
-                builder.parameterTypes.map { it.name }, object : MethodHook() {
-                    override fun after(call: MethodHookParam) {
-                        if (closed || call.throwable != null || call.isOriginalSkipped) return
-                        val popup = call.args[2] ?: return
-                        val scope = call.args[5] ?: return
-                        val action: () -> Unit = {
-                            dismiss.invoke(popup)
-                            open()
-                        }
-                        val content: @Composable () -> Unit = {
-                            label.invoke(null, "六轨混音", Modifier, null, true, currentComposer, 0, 0)
-                        }
-                        append.invoke(scope, action, true, content)
-                    }
-                })
+            syncMenu()
+            menuWatch.start()
         } catch (failure: Throwable) {
             runCatching(::close).onFailure(failure::addSuppressed)
             throw failure
         }
     }
 
+    @Synchronized
+    private fun syncMenu() {
+        if (closed) return
+        val rebuilt = TrackMixLink.amllRebuildsPlayer()
+        if (rebuildMode == rebuilt) return
+        rebuildMode = rebuilt
+        if (rebuilt) {
+            menuHook?.close()
+            menuHook = null
+            return
+        }
+        menuHook = WorkshopApi.hookRegistrar.hookMethod(builder.declaringClass.name, builder.name,
+            builder.parameterTypes.map { it.name }, object : MethodHook() {
+                override fun after(call: MethodHookParam) {
+                    if (closed || call.throwable != null || call.isOriginalSkipped || TrackMixLink.amllRebuildsPlayer()) return
+                    val popup = call.args[2] ?: return
+                    val scope = call.args[5] ?: return
+                    val action: () -> Unit = {
+                        dismiss.invoke(popup)
+                        open()
+                    }
+                    val content: @Composable () -> Unit = {
+                        label.invoke(null, "六轨混音", Modifier, null, true, currentComposer, 0, 0)
+                    }
+                    append.invoke(scope, action, true, content)
+                }
+            })
+    }
+
     fun open() {
         if (!closed) visible = true
     }
 
+    @Synchronized
     override fun close() {
+        menuWatch.stop()
+        menuHook?.let(handles::add)
+        menuHook = null
         closed = true
         visible = false
         var failure: Throwable? = null

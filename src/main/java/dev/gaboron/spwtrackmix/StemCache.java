@@ -24,8 +24,10 @@ final class StemCache {
     static final int FLOATS_PER_FRAME = MixSettings.STEMS * 2;
     static final int BYTES_PER_FRAME = FLOATS_PER_FRAME * Float.BYTES;
     private static final int MAGIC = 0x58494d54;
-    private static final int VERSION = 1;
-    private static final int HEADER_BYTES = 48;
+    private static final int LEGACY_VERSION = 1;
+    private static final int VERSION = 2;
+    private static final int BASE_HEADER_BYTES = 48;
+    static final int HEADER_BYTES = BASE_HEADER_BYTES + LoudnessProfile.BYTES;
     private static final int CHUNK_BYTES = BYTES_PER_FRAME * 16384;
     private static final String MODEL = "a443a298-";
     private final Path root;
@@ -71,7 +73,7 @@ final class StemCache {
         }
     }
 
-    record Entry(Path path, int rate, int frames, long crc, float[] peaks) {
+    record Entry(Path path, int rate, int frames, long crc, float[] peaks, int headerBytes, LoudnessProfile loudness) {
         Entry {
             peaks = peaks.clone();
         }
@@ -106,29 +108,34 @@ final class StemCache {
         return entry;
     }
 
-    Entry publish(Identity id, int rate, int frames, Path raw, Path staging, long limit) throws IOException {
+    Entry publish(Identity id, int rate, int frames, Path raw, Path original, Path staging, long limit)
+            throws IOException {
         long dataBytes = (long) frames * BYTES_PER_FRAME;
         if (dataBytes + HEADER_BYTES > limit) {
             throw new IOException("缓存上限不足以保存这首歌");
         }
-        if (Files.size(raw) != dataBytes || !id.current()) {
+        if (Files.size(raw) != dataBytes || (original != null
+                && Files.size(original) != (long) frames * AudioFormat.FLOAT_FRAME_BYTES) || !id.current()) {
             throw new IOException("分离输出不完整或音频文件已变更");
         }
         Files.createDirectories(root);
         Path target = entryPath(id);
         Path pending = staging.resolve("completed.stems");
         try (var input = FileChannel.open(raw, StandardOpenOption.READ);
+             var reference = original == null ? null : FileChannel.open(original, StandardOpenOption.READ);
              var output = FileChannel.open(pending, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)) {
             var crc = new CRC32C();
             var peaks = new float[MixSettings.STEMS];
             output.position(HEADER_BYTES);
-            scan(input, output, dataBytes, crc, peaks);
+            var analysis = new LoudnessProfile.Analysis(rate);
+            scan(input, output, dataBytes, crc, peaks, analysis, reference);
             output.position(0);
             ByteBuffer header = ordered(HEADER_BYTES);
             header.putInt(MAGIC).putInt(VERSION).putInt(rate).putInt(frames).putLong(crc.getValue());
             for (float peak : peaks) {
                 header.putFloat(peak);
             }
+            analysis.result().write(header);
             header.flip();
             write(output, header);
             output.force(true);
@@ -152,7 +159,7 @@ final class StemCache {
         }
         ByteBuffer data = ordered(Math.multiplyExact(frames, BYTES_PER_FRAME));
         try (var file = FileChannel.open(entry.path, StandardOpenOption.READ)) {
-            file.position(HEADER_BYTES + (long) start * BYTES_PER_FRAME);
+            file.position(entry.headerBytes + (long) start * BYTES_PER_FRAME);
             read(file, data);
         }
         data.flip();
@@ -202,10 +209,12 @@ final class StemCache {
 
     private Entry verify(Path path) throws IOException {
         try (var input = FileChannel.open(path, StandardOpenOption.READ)) {
-            var header = ordered(HEADER_BYTES);
+            var header = ordered(BASE_HEADER_BYTES);
             read(input, header);
             header.flip();
-            if (header.getInt() != MAGIC || header.getInt() != VERSION) {
+            int magic = header.getInt();
+            int version = header.getInt();
+            if (magic != MAGIC || (version != LEGACY_VERSION && version != VERSION)) {
                 throw new IOException("音轨缓存版本不匹配");
             }
             int rate = header.getInt();
@@ -216,22 +225,34 @@ final class StemCache {
                 peaks[track] = header.getFloat();
             }
             long dataBytes = (long) frames * BYTES_PER_FRAME;
-            if (rate < 8000 || rate > 384000 || frames <= 0 || input.size() != HEADER_BYTES + dataBytes) {
+            int headerBytes = version == VERSION ? HEADER_BYTES : BASE_HEADER_BYTES;
+            if (rate < 8000 || rate > 384000 || frames <= 0 || input.size() != headerBytes + dataBytes) {
                 throw new IOException("音轨缓存长度或格式无效");
             }
             var actual = new CRC32C();
             var actualPeaks = new float[MixSettings.STEMS];
-            scan(input, null, dataBytes, actual, actualPeaks);
+            LoudnessProfile profile = null;
+            if (version == VERSION) {
+                var metadata = ordered(LoudnessProfile.BYTES);
+                read(input, metadata);
+                metadata.flip();
+                profile = LoudnessProfile.read(metadata);
+            }
+            // Version 1 never stored the source reference, so estimate it from the six stems.
+            var analysis = profile == null ? new LoudnessProfile.Analysis(rate) : null;
+            scan(input, null, dataBytes, actual, actualPeaks, analysis, null);
             if (actual.getValue() != checksum || !java.util.Arrays.equals(peaks, actualPeaks)) {
                 throw new IOException("音轨缓存完整性检查失败");
             }
-            return new Entry(path, rate, frames, checksum, peaks);
+            return new Entry(path, rate, frames, checksum, peaks, headerBytes,
+                    profile == null ? analysis.result() : profile);
         }
     }
 
-    private static void scan(FileChannel input, FileChannel output, long remaining, CRC32C crc, float[] peaks)
-            throws IOException {
+    private static void scan(FileChannel input, FileChannel output, long remaining, CRC32C crc, float[] peaks,
+                             LoudnessProfile.Analysis analysis, FileChannel original) throws IOException {
         var chunk = ordered(CHUNK_BYTES);
+        var source = original == null ? null : ordered(CHUNK_BYTES / FLOATS_PER_FRAME * 2);
         while (remaining > 0) {
             checkInterrupted();
             int size = (int) Math.min(chunk.capacity(), remaining);
@@ -239,6 +260,11 @@ final class StemCache {
             read(input, chunk);
             chunk.flip();
             crc.update(chunk.array(), 0, size);
+            if (source != null) {
+                source.clear().limit(size / FLOATS_PER_FRAME * 2);
+                read(original, source);
+                source.flip();
+            }
             for (int offset = 0; offset < size; offset += BYTES_PER_FRAME) {
                 for (int stem = 0; stem < peaks.length; stem++) {
                     int index = offset + stem * 2 * Float.BYTES;
@@ -247,6 +273,9 @@ final class StemCache {
                         throw new IOException("音轨缓存含有无效样本");
                     }
                     peaks[stem] = Math.max(peaks[stem], max);
+                }
+                if (analysis != null) {
+                    analysis.accept(chunk, offset, source, offset / FLOATS_PER_FRAME * 2);
                 }
             }
             if (output != null) {

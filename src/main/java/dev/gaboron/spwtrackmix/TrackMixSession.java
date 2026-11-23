@@ -8,6 +8,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
 import java.util.function.UnaryOperator;
@@ -30,6 +31,7 @@ final class TrackMixSession implements AutoCloseable {
             task -> thread(task, "Track Mix preload"));
     private final ExecutorService worker = Executors.newSingleThreadExecutor(task -> thread(task, "Track Mix worker"));
     private final AtomicLong cacheRevision = new AtomicLong();
+    private final AtomicBoolean seekPrefetchQueued = new AtomicBoolean();
     private final Object configurationLock = new Object();
     private volatile TrackMixOptions options;
     private TrackMixOptions saved;
@@ -181,7 +183,7 @@ final class TrackMixSession implements AutoCloseable {
             engine.separate(task, input, output, format.rate(), parameters);
             task.check();
             task.report("cache", 0);
-            cache.publish(selected.identity, format.rate(), format.frames(), output, staging, options.cacheBytes());
+            cache.publish(selected.identity, format.rate(), format.frames(), output, input, staging, options.cacheBytes());
             return "六轨分离已完成";
         } finally {
             Thread.interrupted();
@@ -271,6 +273,33 @@ final class TrackMixSession implements AutoCloseable {
             if (old != null) {
                 selection = new Selection(old.track, null, null, display(error));
             }
+        }
+    }
+
+    Object[] spectrum(String source, long positionMs) {
+        var active = effects;
+        if (active == null) {
+            return null;
+        }
+        try {
+            return active.spectrum(Path.of(source).toAbsolutePath().normalize(), positionMs);
+        } catch (java.nio.file.InvalidPathException invalid) {
+            return null;
+        }
+    }
+
+    void sourceSeeking(int channel, long position) {
+        var active = effects;
+        if (active == null || !active.prepareSeek(channel, position) || !seekPrefetchQueued.compareAndSet(false, true)) {
+            return;
+        }
+        try {
+            preloader.execute(() -> {
+                seekPrefetchQueued.set(false);
+                prefetch();
+            });
+        } catch (java.util.concurrent.RejectedExecutionException stopped) {
+            seekPrefetchQueued.set(false);
         }
     }
 

@@ -74,7 +74,7 @@ final class BassChecks {
         }
         Files.write(raw, samples.array());
         return new StemCache(work.resolve("cache"), WindowsRecycle::recycle)
-                .publish(StemCache.Identity.read(fixture), 44100, count, raw, work, Long.MAX_VALUE);
+                .publish(StemCache.Identity.read(fixture), 44100, count, raw, work.resolve("decoded.f32"), work, Long.MAX_VALUE);
     }
 
     private static void exercise(SymbolLookup bass, SymbolLookup mixer, BassLibrary library, Path fixture,
@@ -112,18 +112,33 @@ final class BassChecks {
 
             settings.set(settings.get().withPreset(MixSettings.Preset.VOCALS));
             pull(read, mix, buffer);
-            check(buffer, FRAMES, 500, 0);
+            float gain = cache.loudness().gainFor(settings.get());
+            check(buffer, FRAMES, 500, 0, gain);
             int jump = 132407;
             seek(seek, stream, jump, sourceFrameBytes);
             pull(read, mix, buffer);
-            check(buffer, jump, 0, -1);
+            for (int sample = 0; sample < FRAMES * 2; sample++) {
+                require(buffer.getAtIndex(JAVA_FLOAT, sample) == 0, "unprepared seek leaked original audio");
+            }
             effects.prefetch(fixture, cache);
             pull(read, mix, buffer);
-            check(buffer, jump + FRAMES, 500, 0);
+            check(buffer, jump + FRAMES, 500, 0, gain);
+            int prepared = 260_000;
+            require(effects.prepareSeek(stream, (long) prepared * sourceFrameBytes), "seek was not scheduled");
+            effects.prefetch(fixture, cache);
+            seek(seek, stream, prepared, sourceFrameBytes);
+            pull(read, mix, buffer);
+            require(Math.abs(buffer.getAtIndex(JAVA_FLOAT, 0)) < .002f, "prepared seek used dry audio");
+            check(buffer, prepared, 500, 0, gain);
+            Object[] mixedSpectrum = effects.spectrum(fixture, (prepared + 500L) * 1000 / cache.rate());
+            require(mixedSpectrum != null && ((float[]) mixedSpectrum[1]).length == 4096,
+                    "BASS mixed PCM did not reach AMLL's spectrum");
+            require(((float[]) effects.spectrum(fixture, (jump + 500L) * 1000 / cache.rate())[1]).length == 0,
+                    "BASS seek left the prior spectrum available");
 
             admitted.set(null);
             pull(read, mix, buffer);
-            check(buffer, jump + FRAMES * 2, 0, -1);
+            check(buffer, prepared + FRAMES, 0, -1);
             int beforeLoop = ProbeSignal.FRAME_COUNT - 110;
             seek(seek, stream, beforeLoop, sourceFrameBytes);
             pull(read, mix, buffer);
@@ -143,18 +158,22 @@ final class BassChecks {
             effects.prefetch(fixture, cache);
             require((int) add.invokeExact(mix, replacement, NO_RAMP) != 0, "could not add replacement source");
             pull(read, mix, buffer);
-            check(buffer, 0, 500, 0);
+            check(buffer, 0, 500, 0, cache.loudness().gainFor(settings.get()));
             require((int) free.invokeExact(replacement) != 0, "replacement stream could not be freed");
         }
         require((int) free.invokeExact(mix) != 0, "test mixer could not be freed");
     }
 
     private static void check(MemorySegment block, int sourceFrame, int skip, int track) {
+        check(block, sourceFrame, skip, track, 1);
+    }
+
+    private static void check(MemorySegment block, int sourceFrame, int skip, int track, float gain) {
         for (int frame = skip; frame < FRAMES; frame++) {
             for (int channel = 0; channel < 2; channel++) {
                 short value = track < 0 ? ProbeSignal.originalSample(sourceFrame + frame, channel)
                         : ProbeSignal.stemSample(track, sourceFrame + frame, channel);
-                near(block.getAtIndex(JAVA_FLOAT, frame * 2L + channel), value / 32768f,
+                near(block.getAtIndex(JAVA_FLOAT, frame * 2L + channel), value / 32768f * gain,
                         "BASS source frame " + (sourceFrame + frame));
             }
         }

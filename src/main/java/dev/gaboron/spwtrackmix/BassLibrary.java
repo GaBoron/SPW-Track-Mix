@@ -120,7 +120,7 @@ final class BassLibrary {
                 if (format == null || format.frameBytes() != AudioFormat.FLOAT_FRAME_BYTES) {
                     throw new IOException("当前只支持可定位的本地立体声 PCM 音频");
                 }
-                if ((long) format.frames() * StemCache.BYTES_PER_FRAME + 48 > cacheLimit) {
+                if ((long) format.frames() * StemCache.BYTES_PER_FRAME + StemCache.HEADER_BYTES > cacheLimit) {
                     throw new IOException("缓存上限不足以保存这首歌");
                 }
                 writeDecoded(stream, format, output, arena, progress);

@@ -4,6 +4,9 @@ import java.lang.classfile.ClassFile;
 import java.lang.classfile.instruction.InvokeInstruction;
 import java.lang.invoke.MethodType;
 import java.nio.file.Path;
+import java.lang.management.ManagementFactory;
+import java.util.Map;
+import javax.management.ObjectName;
 import java.util.zip.ZipFile;
 
 /** Checks the native entry points against the installed host archive without starting SPW. */
@@ -15,9 +18,25 @@ final class HostBindingChecks {
                 .getDeclaredMethod("\u037f", signature.parameterArray());
         PcmChecks.require(factory.getReturnType() == int.class, "BASS source factory changed");
 
+        var seek = Class.forName("com.xuncorp.pisces.bass.impl.BassMixImpl", false, loader)
+                .getDeclaredMethod("\u037f", int.class, long.class, int.class);
+        PcmChecks.require(seek.getReturnType() == boolean.class, "BASS mixer seek binding changed");
+
         try (var archive = new ZipFile(args[0]);
              var session = new TrackMixSession(Path.of(args[0]).getParent().resolve("unused-track-mix-check"), () -> null);
              var ui = new TrackMixHostUi(session)) {
+            var decoder = archive.getEntry("com/xuncorp/pisces/bass/impl/\u052a.class");
+            PcmChecks.require(decoder != null, "native file decoder missing");
+            try (var stream = archive.getInputStream(decoder)) {
+                var model = ClassFile.of().parse(stream.readAllBytes());
+                boolean usesFactory = model.methods().stream().flatMap(method -> method.code().stream())
+                        .flatMap(code -> code.elementList().stream())
+                        .anyMatch(element -> element instanceof InvokeInstruction invoke
+                                && invoke.owner().asInternalName().equals(factory.getDeclaringClass().getName().replace('.', '/'))
+                                && invoke.name().equalsString(factory.getName())
+                                && invoke.type().equalsString(signature.toMethodDescriptorString()));
+                PcmChecks.require(usesFactory, "native decoder no longer calls the PCM hook");
+            }
             var navigation = ui.getNavigation();
             String owner = navigation.getDeclaringClass().getName().replace('.', '/');
             String descriptor = MethodType.methodType(navigation.getReturnType(), navigation.getParameterTypes())
@@ -37,6 +56,16 @@ final class HostBindingChecks {
                 PcmChecks.require(sites == 1, "native navigation hook call must be unique");
             }
         }
-        System.out.println("Installed SPW bindings verified: file-source DSP, menu builder, theme and dialog host.");
+        var name = new ObjectName("dev.gaboron.spwtrackmix:type=Mixer,version=1");
+        var server = ManagementFactory.getPlatformMBeanServer();
+        try (var session = new TrackMixSession(Path.of(args[0]).getParent().resolve("unused-track-mix-check"), () -> null);
+             var link = new TrackMixLink(session)) {
+            var state = (Map<?, ?>) server.getAttribute(name, "State");
+            PcmChecks.require(((int[]) state.get("levels")).length == 6, "AMLL mixer levels unavailable");
+            PcmChecks.require(server.invoke(name, "spectrum", new Object[]{"fixture", 0L},
+                    new String[]{"java.lang.String", "long"}) == null, "no source must report no mixed spectrum");
+        }
+        PcmChecks.require(!server.isRegistered(name), "AMLL mixer bridge remains registered");
+        System.out.println("Installed SPW bindings verified: file-source DSP, seek, menu, theme, dialog and AMLL endpoint.");
     }
 }

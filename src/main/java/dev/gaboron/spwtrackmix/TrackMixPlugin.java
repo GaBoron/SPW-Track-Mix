@@ -17,10 +17,14 @@ public final class TrackMixPlugin extends SpwPlugin {
     private static final String BASS_BINDING = "com.moriafly.bass.BASS";
     // The local file factory in the Windows Steam 1.19.3 installation.
     private static final String CREATE_FILE_STREAM = "\u037f";
+    private static final String HOST_FILE_DECODER = "com.xuncorp.pisces.bass.impl.\u052a";
+    private static final StackWalker STACK = StackWalker.getInstance();
     private static volatile TrackMixHostUi mixerWindow;
 
     private HookHandle streamHook;
+    private HookHandle seekHook;
     private TrackMixSession session;
+    private TrackMixLink link;
     private TrackMixHostUi window;
 
     public TrackMixPlugin(PluginContext context) {
@@ -65,24 +69,37 @@ public final class TrackMixPlugin extends SpwPlugin {
                             if (!call.isOriginalSkipped() && call.getThrowable() == null
                                     && call.getResult() instanceof Integer channel && channel != 0) {
                                 Object[] args = call.getArgs();
-                                if (args[0] instanceof String path && (long) args[1] == 0 && (long) args[2] == 0) {
+                                if (args[0] instanceof String path && (long) args[1] == 0 && (long) args[2] == 0
+                                        && STACK.walk(frames -> frames.anyMatch(frame -> frame.getClassName().equals(HOST_FILE_DECODER)))) {
                                     created.sourceOpened(channel, path);
                                 }
+                            }
+                        }
+                    });
+            seekHook = WorkshopApi.hookRegistrar().hookMethod("com.xuncorp.pisces.bass.impl.BassMixImpl",
+                    "\u037f", List.of("int", "long", "int"), new MethodHook() {
+                        @Override
+                        public void before(MethodHookParam call) {
+                            Object[] args = call.getArgs();
+                            int mode = (int) args[2];
+                            // This binding uses absolute byte positions. These two flags control mixer buffering.
+                            if ((mode & ~(0x10000 | 0x800000)) == 0) {
+                                created.sourceSeeking((int) args[0], (long) args[1]);
                             }
                         }
                     });
             window = new TrackMixHostUi(created);
             window.install();
             created.start();
+            link = new TrackMixLink(created);
             session = created;
             mixerWindow = window;
         } catch (RuntimeException | Error error) {
             try {
-                if (streamHook != null) {
-                    streamHook.unhook();
-                    streamHook = null;
-                }
+                closeAudioHooks(streamHook, seekHook);
             } finally {
+                streamHook = null;
+                seekHook = null;
                 try {
                     if (window != null) {
                         window.close();
@@ -116,13 +133,19 @@ public final class TrackMixPlugin extends SpwPlugin {
     @Override
     public void stop() {
         HookHandle hook;
+        HookHandle seek;
         TrackMixSession active;
+        TrackMixLink oldLink;
         TrackMixHostUi oldWindow;
         synchronized (this) {
             hook = streamHook;
             streamHook = null;
+            seek = seekHook;
+            seekHook = null;
             active = session;
             session = null;
+            oldLink = link;
+            link = null;
             oldWindow = window;
             window = null;
             if (mixerWindow == oldWindow) {
@@ -131,18 +154,34 @@ public final class TrackMixPlugin extends SpwPlugin {
         }
 
         try {
-            if (hook != null) {
-                hook.unhook();
-            }
+            closeAudioHooks(hook, seek);
         } finally {
             try {
                 if (oldWindow != null) {
                     oldWindow.close();
                 }
             } finally {
-                if (active != null) {
-                    active.close();
+                try {
+                    if (oldLink != null) {
+                        oldLink.close();
+                    }
+                } finally {
+                    if (active != null) {
+                        active.close();
+                    }
                 }
+            }
+        }
+    }
+
+    private static void closeAudioHooks(HookHandle source, HookHandle seek) {
+        try {
+            if (seek != null) {
+                seek.unhook();
+            }
+        } finally {
+            if (source != null) {
+                source.unhook();
             }
         }
     }

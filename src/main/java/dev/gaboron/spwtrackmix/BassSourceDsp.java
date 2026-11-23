@@ -9,6 +9,7 @@ import java.lang.invoke.MethodType;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Supplier;
 
 final class BassSourceDsp implements AutoCloseable {
@@ -74,11 +75,44 @@ final class BassSourceDsp implements AutoCloseable {
         for (Registration registration : forPrefetch) {
             if (registration.released || entry == null || !registration.path.equals(path)
                     || !registration.format.matches(entry)) {
-                registration.window = null;
+                registration.clearWindows();
             } else {
                 registration.loadWindow(entry);
             }
         }
+    }
+
+    boolean prepareSeek(int channel, long bytePosition) {
+        StemCache.Entry current = admitted.get();
+        if (current == null || settings.get().original()) {
+            return false;
+        }
+        for (Registration registration : forPrefetch) {
+            if (registration.channel == channel && !registration.released
+                    && registration.selected == current) {
+                long frame = bytePosition / registration.format.frameBytes();
+                if (bytePosition >= 0 && frame < current.frames()) {
+                    registration.requestedFrame.set((int) frame);
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    Object[] spectrum(Path path, long positionMs) {
+        var entry = admitted.get();
+        if (entry == null || settings.get().original()) {
+            return null;
+        }
+        for (Registration registration : forPrefetch) {
+            if (registration.selected == entry && registration.path.equals(path)
+                    && !registration.released && !registration.bypassed) {
+                var tap = registration.spectrum;
+                return tap == null ? new Object[]{entry.rate(), new float[0], new float[0]} : tap.at(positionMs);
+            }
+        }
+        return null;
     }
 
     boolean attached(Path path, StemCache.Entry entry) {
@@ -97,7 +131,7 @@ final class BassSourceDsp implements AutoCloseable {
         forPrefetch = NONE;
         for (Registration registration : registrations) {
             registration.bypassed = true;
-            registration.window = null;
+            registration.clearWindows();
         }
         for (var iterator = registrations.iterator(); iterator.hasNext();) {
             Registration registration = iterator.next();
@@ -126,6 +160,11 @@ final class BassSourceDsp implements AutoCloseable {
         private volatile boolean bypassed;
         private volatile int decodedFrame;
         private volatile StemCache.Window window;
+        private volatile StemCache.Window openingWindow;
+        private volatile StemCache.Window seekWindow;
+        private volatile StemCache.Entry selected;
+        private volatile MixedSpectrum spectrum;
+        private final AtomicInteger requestedFrame = new AtomicInteger(-1);
 
         private Registration(int channel, Path path, AudioFormat format) {
             this.channel = channel;
@@ -134,16 +173,68 @@ final class BassSourceDsp implements AutoCloseable {
             mixer = new RealtimeStemMixer(format.rate());
         }
 
+        private void clearWindows() {
+            window = null;
+            openingWindow = null;
+            seekWindow = null;
+            selected = null;
+            spectrum = null;
+            requestedFrame.set(-1);
+        }
+
         private void loadWindow(StemCache.Entry entry) throws IOException {
-            int frame = decodedFrame;
-            int ahead = Math.min(entry.frames() - frame, Math.min(format.rate() / 3, 40_000));
-            var old = window;
-            if (frame >= entry.frames() || (old != null && old.entry() == entry && old.covers(frame, ahead))) {
-                return;
+            if (selected != entry || spectrum == null) {
+                spectrum = new MixedSpectrum(entry.rate());
             }
+            selected = entry;
+            int request = requestedFrame.getAndSet(-1);
+            if (request >= 0) {
+                if (!covers(window, entry, request, usableAhead(entry, request))
+                        && !covers(openingWindow, entry, request, usableAhead(entry, request))
+                        && !covers(seekWindow, entry, request, usableAhead(entry, request))) {
+                    seekWindow = readWindow(entry, request);
+                }
+            }
+            int frame = decodedFrame;
+            int ahead = usableAhead(entry, frame);
+            if (covers(seekWindow, entry, frame, ahead)) {
+                window = seekWindow;
+            } else if (covers(openingWindow, entry, frame, ahead)) {
+                window = openingWindow;
+            } else if (!covers(window, entry, frame, ahead) && frame < entry.frames()) {
+                window = readWindow(entry, frame);
+            }
+            if (openingWindow == null || openingWindow.entry() != entry) {
+                openingWindow = frame == 0 && covers(window, entry, 0, ahead) ? window
+                        : StemCache.readWindow(entry, 0, Math.min(entry.frames(), entry.rate()));
+            }
+        }
+
+        private int usableAhead(StemCache.Entry entry, int frame) {
+            return Math.min(entry.frames() - frame, Math.min(format.rate() / 3, 40_000));
+        }
+
+        private StemCache.Window readWindow(StemCache.Entry entry, int frame) throws IOException {
             int start = Math.max(0, frame - Math.min(format.rate() / 4, 24_000));
             int count = Math.min(entry.frames() - start, Math.min(format.rate() * 2, 192_000));
-            window = StemCache.readWindow(entry, start, count);
+            return StemCache.readWindow(entry, start, count);
+        }
+
+        private boolean covers(StemCache.Window candidate, StemCache.Entry entry, long frame, int frames) {
+            return candidate != null && candidate.entry() == entry && candidate.covers(frame, frames);
+        }
+
+        private StemCache.Window windowAt(StemCache.Entry entry, long frame, int frames) {
+            var ready = window;
+            if (covers(ready, entry, frame, frames)) {
+                return ready;
+            }
+            var seek = seekWindow;
+            if (covers(seek, entry, frame, frames)) {
+                return seek;
+            }
+            var beginning = openingWindow;
+            return covers(beginning, entry, frame, frames) ? beginning : null;
         }
 
         private void onBlock(int effect, int source, MemorySegment buffer, int length, MemorySegment user) {
@@ -151,7 +242,7 @@ final class BassSourceDsp implements AutoCloseable {
                 // BASS_DSP_FREECALL signals that this effect was detached or its source was freed.
                 if (buffer.address() == 0) {
                     released = true;
-                    window = null;
+                    clearWindows();
                     return;
                 }
                 if (bypassed || source != channel || length <= 0 || length % AudioFormat.FLOAT_FRAME_BYTES != 0) {
@@ -166,12 +257,18 @@ final class BassSourceDsp implements AutoCloseable {
                     return;
                 }
                 decodedFrame = (int) frame;
-                StemCache.Window ready = window;
-                if (ready != null && ready.entry() != admitted.get()) {
-                    ready = null;
+                int frames = length / AudioFormat.FLOAT_FRAME_BYTES;
+                StemCache.Entry entry = admitted.get();
+                if (entry != selected) {
+                    entry = null;
                 }
-                mixer.process(buffer.reinterpret(length), frame, length / AudioFormat.FLOAT_FRAME_BYTES,
-                        ready, settings.get());
+                var pcm = buffer.reinterpret(length);
+                if (mixer.process(pcm, frame, frames, entry, windowAt(entry, frame, frames), settings.get())) {
+                    var tap = spectrum;
+                    if (tap != null) {
+                        tap.write(pcm, (int) frame, frames);
+                    }
+                }
             } catch (Throwable error) {
                 // Exceptions must never escape an FFM upcall on the host audio thread.
                 bypassed = true;
