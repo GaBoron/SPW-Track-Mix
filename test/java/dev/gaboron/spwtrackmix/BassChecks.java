@@ -12,6 +12,9 @@ import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static dev.gaboron.spwtrackmix.PcmChecks.near;
@@ -35,7 +38,7 @@ final class BassChecks {
         Path resources = Path.of(args[0]).toAbsolutePath();
         Path fixture = Path.of(args[1]).toAbsolutePath();
         Path workspace = Files.createTempDirectory("spw-track-mix-bass-check-").toAbsolutePath().normalize();
-        try (var arena = Arena.ofConfined()) {
+        try (var arena = Arena.ofShared()) {
             var bassPath = resources.resolve("bass.dll");
             var bass = SymbolLookup.libraryLookup(bassPath, arena);
             var mixer = SymbolLookup.libraryLookup(resources.resolve("bassmix.dll"), arena);
@@ -51,6 +54,7 @@ final class BassChecks {
                 var entry = fixtureCache(fixture, workspace);
                 exercise(bass, mixer, library, fixture, entry, arena, FLOAT, 8);
                 exercise(bass, mixer, library, fixture, entry, arena, 0, 4);
+                exerciseConcurrentDetach(bass, mixer, library, fixture, entry);
             } finally {
                 var free = bind(bass, "BASS_Free", JAVA_INT);
                 require((int) free.invokeExact() != 0, "BASS could not release its no-sound device");
@@ -58,7 +62,7 @@ final class BassChecks {
         } finally {
             WindowsRecycle.recycle(workspace);
         }
-        System.out.println("Native BASS verified: decode, float and PCM16 DSP, pause, seek recovery, loop, source change and detach.");
+        System.out.println("Native BASS verified: decode, float and PCM16 DSP, pause, seek recovery, loop, source change and concurrent detach.");
     }
 
     private static StemCache.Entry fixtureCache(Path fixture, Path work) throws Exception {
@@ -162,6 +166,80 @@ final class BassChecks {
             require((int) free.invokeExact(replacement) != 0, "replacement stream could not be freed");
         }
         require((int) free.invokeExact(mix) != 0, "test mixer could not be freed");
+    }
+
+    private static void exerciseConcurrentDetach(SymbolLookup bass, SymbolLookup mixer, BassLibrary library, Path fixture,
+                                                 StemCache.Entry cache) throws Throwable {
+        var create = bind(bass, "BASS_StreamCreateFile", JAVA_INT, JAVA_INT, ADDRESS,
+                JAVA_LONG, JAVA_LONG, JAVA_INT);
+        var createMixer = bind(mixer, "BASS_Mixer_StreamCreate", JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT);
+        var add = bind(mixer, "BASS_Mixer_StreamAddChannel", JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT);
+        var read = bind(bass, "BASS_ChannelGetData", JAVA_INT, JAVA_INT, ADDRESS, JAVA_INT);
+        var free = bind(bass, "BASS_StreamFree", JAVA_INT, JAVA_INT);
+        try (var arena = Arena.ofShared()) {
+            var name = arena.allocateFrom(fixture.toString(), StandardCharsets.UTF_16LE);
+            var pcm = arena.allocate(FRAMES * 8L, 8);
+            for (int attempt = 0; attempt < 16; attempt++) {
+                int channel = (int) create.invokeExact(0, name, 0L, 0L, UNICODE | DECODE | FLOAT);
+                int output = (int) createMixer.invokeExact(44100, 2, DECODE | FLOAT);
+                require(channel != 0 && output != 0, "concurrent detach source or mixer not opened");
+                var entered = new CountDownLatch(1);
+                var resume = new CountDownLatch(1);
+                var stopping = new CountDownLatch(1);
+                var failure = new AtomicReference<Throwable>();
+                var mix = MixSettings.DEFAULT.withPreset(MixSettings.Preset.VOCALS);
+                try (var effects = new BassSourceDsp(library, () -> {
+                    entered.countDown();
+                    try {
+                        if (!resume.await(5, TimeUnit.SECONDS)) {
+                            failure.set(new AssertionError("detach test did not release the callback"));
+                        }
+                    } catch (InterruptedException error) {
+                        Thread.currentThread().interrupt();
+                        failure.set(error);
+                    }
+                    return mix;
+                }, () -> cache)) {
+                    require(effects.attach(channel, fixture), "concurrent detach DSP not attached");
+                    effects.prefetch(fixture, cache);
+                    require((int) add.invokeExact(output, channel, NO_RAMP) != 0, "concurrent detach source not mixed");
+                    var audioThread = Thread.ofPlatform().daemon().start(() -> {
+                        try {
+                            pull(read, output, pcm);
+                        } catch (Throwable error) {
+                            failure.set(error);
+                        }
+                    });
+                    if (!entered.await(5, TimeUnit.SECONDS)) {
+                        throw new AssertionError("DSP did not enter the active callback", failure.get());
+                    }
+                    var stopThread = Thread.ofPlatform().daemon().start(() -> {
+                        stopping.countDown();
+                        try {
+                            effects.close();
+                        } catch (Throwable error) {
+                            failure.set(error);
+                        }
+                    });
+                    try {
+                        require(stopping.await(5, TimeUnit.SECONDS), "DSP detach did not start");
+                    } finally {
+                        resume.countDown();
+                    }
+                    require(audioThread.join(Duration.ofSeconds(5)) && stopThread.join(Duration.ofSeconds(5)),
+                            "audio and detach did not finish");
+                    if (failure.get() != null) {
+                        throw failure.get();
+                    }
+                    require(!effects.attached(fixture, cache), "retired DSP still reported attached");
+                    pull(read, output, pcm);
+                    check(pcm, FRAMES, 0, -1);
+                } finally {
+                    require((int) free.invokeExact(channel) != 0, "concurrent detach source not freed");
+                    require((int) free.invokeExact(output) != 0, "concurrent detach mixer not freed");
+                }
+            }
+        }
     }
 
     private static void check(MemorySegment block, int sourceFrame, int skip, int track) {

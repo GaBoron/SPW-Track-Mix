@@ -171,9 +171,8 @@ final class BassLibrary {
         return (long) channelPosition.invokeExact(channel, POS_DSP);
     }
 
-    int addDsp(int channel, MethodHandle callback, Arena arena) throws Throwable {
-        MemorySegment function = LINKER.upcallStub(callback, DSP_PROC, arena);
-        return (int) addDsp.invokeExact(channel, function, MemorySegment.NULL, 100, DSP_FREECALL | DSP_FLOAT);
+    int addDsp(int channel, MemorySegment function, MemorySegment context) throws Throwable {
+        return (int) addDsp.invokeExact(channel, function, context, 100, DSP_FREECALL | DSP_FLOAT);
     }
 
     boolean freeDsp(int dsp) throws Throwable {

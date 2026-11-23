@@ -2,28 +2,48 @@ package dev.gaboron.spwtrackmix;
 
 import java.io.IOException;
 import java.lang.foreign.Arena;
+import java.lang.foreign.Linker;
 import java.lang.foreign.MemorySegment;
-import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
-import java.lang.invoke.MethodType;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
 
 final class BassSourceDsp implements AutoCloseable {
     private static final System.Logger LOG = System.getLogger(BassSourceDsp.class.getName());
     private static final Registration[] NONE = {};
-    private static final MethodHandle CALLBACK;
+    private static final AtomicLong NEXT_CONTEXT = new AtomicLong();
+    private static final ConcurrentHashMap<Long, Registration> CALLBACKS = new ConcurrentHashMap<>();
+    // A free notification runs inside the native trampoline. Keep one trampoline alive
+    // for the process and retire each registration by its non-reused context token.
+    private static final MemorySegment CALLBACK = createCallback();
 
-    static {
+    private static MemorySegment createCallback() {
         try {
-            CALLBACK = MethodHandles.lookup().findVirtual(Registration.class, "onBlock",
-                    MethodType.methodType(void.class, int.class, int.class,
-                            MemorySegment.class, int.class, MemorySegment.class));
-        } catch (ReflectiveOperationException e) {
-            throw new ExceptionInInitializerError(e);
+            var target = MethodHandles.lookup().findStatic(BassSourceDsp.class, "onNativeBlock",
+                    BassLibrary.DSP_PROC.toMethodType());
+            return Linker.nativeLinker().upcallStub(target, BassLibrary.DSP_PROC, Arena.global());
+        } catch (ReflectiveOperationException error) {
+            throw new ExceptionInInitializerError(error);
+        }
+    }
+
+    private static void onNativeBlock(int effect, int channel, MemorySegment buffer, int length, MemorySegment context) {
+        Registration registration = null;
+        try {
+            registration = CALLBACKS.get(context.address());
+            if (registration != null) {
+                registration.onBlock(channel, buffer, length);
+            }
+        } catch (Throwable error) {
+            // Throwing through an FFM upcall terminates the JVM.
+            if (registration != null) {
+                registration.bypassed = true;
+            }
         }
     }
 
@@ -46,9 +66,9 @@ final class BassSourceDsp implements AutoCloseable {
         }
         for (var iterator = registrations.iterator(); iterator.hasNext();) {
             Registration registration = iterator.next();
-            if (registration.released && registration.closeArena()) {
+            if (registration.released) {
                 iterator.remove();
-            } else if (!registration.released && registration.channel == channel) {
+            } else if (registration.channel == channel) {
                 return false;
             }
         }
@@ -59,12 +79,14 @@ final class BassSourceDsp implements AutoCloseable {
         }
 
         Registration registration = new Registration(channel, path, format);
+        CALLBACKS.put(registration.context, registration);
         registrations.add(registration);
         try {
-            registration.dsp = library.addDsp(channel, CALLBACK.bindTo(registration), registration.arena);
-            return registration.dsp != 0;
+            registration.dsp = library.addDsp(channel, CALLBACK, MemorySegment.ofAddress(registration.context));
+            return registration.dsp != 0 && !registration.released;
         } finally {
-            if (registration.dsp == 0 && registration.closeArena()) {
+            if (registration.dsp == 0 || registration.released) {
+                registration.retire();
                 registrations.remove(registration);
             }
             forPrefetch = registrations.toArray(Registration[]::new);
@@ -131,22 +153,19 @@ final class BassSourceDsp implements AutoCloseable {
         forPrefetch = NONE;
         for (Registration registration : registrations) {
             registration.bypassed = true;
-            registration.clearWindows();
         }
-        for (var iterator = registrations.iterator(); iterator.hasNext();) {
-            Registration registration = iterator.next();
+        for (Registration registration : registrations) {
             try {
-                if (registration.released || library.freeDsp(registration.dsp)) {
-                    if (registration.closeArena()) {
-                        iterator.remove();
-                    }
-                } else {
+                if (!registration.released && !library.freeDsp(registration.dsp) && !registration.released) {
                     LOG.log(System.Logger.Level.WARNING, "BASS DSP is bypassed pending native release");
                 }
             } catch (Throwable error) {
                 LOG.log(System.Logger.Level.WARNING, "Could not release the bypassed BASS DSP", error);
+            } finally {
+                registration.retire();
             }
         }
+        registrations.clear();
     }
 
     private final class Registration {
@@ -154,7 +173,7 @@ final class BassSourceDsp implements AutoCloseable {
         private final Path path;
         private final AudioFormat format;
         private final RealtimeStemMixer mixer;
-        private final Arena arena = Arena.ofShared();
+        private final long context = NEXT_CONTEXT.incrementAndGet();
         private int dsp;
         private volatile boolean released;
         private volatile boolean bypassed;
@@ -237,52 +256,43 @@ final class BassSourceDsp implements AutoCloseable {
             return covers(beginning, entry, frame, frames) ? beginning : null;
         }
 
-        private void onBlock(int effect, int source, MemorySegment buffer, int length, MemorySegment user) {
-            try {
-                // BASS_DSP_FREECALL signals that this effect was detached or its source was freed.
-                if (buffer.address() == 0) {
-                    released = true;
-                    clearWindows();
-                    return;
+        private void onBlock(int source, MemorySegment buffer, int length) throws Throwable {
+            // A null buffer indicates that BASS has removed the DSP or freed the source.
+            if (buffer.address() == 0) {
+                retire();
+                return;
+            }
+            if (source != channel || released || bypassed
+                    || length <= 0 || length % AudioFormat.FLOAT_FRAME_BYTES != 0) {
+                return;
+            }
+            long position = library.dspBytePosition(channel);
+            if (position < 0 || position % format.frameBytes() != 0) {
+                return;
+            }
+            long frame = position / format.frameBytes();
+            if (frame >= format.frames()) {
+                return;
+            }
+            decodedFrame = (int) frame;
+            int frames = length / AudioFormat.FLOAT_FRAME_BYTES;
+            StemCache.Entry entry = admitted.get();
+            if (entry != selected) {
+                entry = null;
+            }
+            var pcm = buffer.reinterpret(length);
+            if (mixer.process(pcm, frame, frames, entry, windowAt(entry, frame, frames), settings.get())) {
+                var tap = spectrum;
+                if (tap != null) {
+                    tap.write(pcm, (int) frame, frames);
                 }
-                if (bypassed || source != channel || length <= 0 || length % AudioFormat.FLOAT_FRAME_BYTES != 0) {
-                    return;
-                }
-                long position = library.dspBytePosition(channel);
-                if (position < 0 || position % format.frameBytes() != 0) {
-                    return;
-                }
-                long frame = position / format.frameBytes();
-                if (frame >= format.frames()) {
-                    return;
-                }
-                decodedFrame = (int) frame;
-                int frames = length / AudioFormat.FLOAT_FRAME_BYTES;
-                StemCache.Entry entry = admitted.get();
-                if (entry != selected) {
-                    entry = null;
-                }
-                var pcm = buffer.reinterpret(length);
-                if (mixer.process(pcm, frame, frames, entry, windowAt(entry, frame, frames), settings.get())) {
-                    var tap = spectrum;
-                    if (tap != null) {
-                        tap.write(pcm, (int) frame, frames);
-                    }
-                }
-            } catch (Throwable error) {
-                // Exceptions must never escape an FFM upcall on the host audio thread.
-                bypassed = true;
             }
         }
 
-        private boolean closeArena() {
-            try {
-                arena.close();
-                return true;
-            } catch (IllegalStateException busy) {
-                // An in-flight upcall can keep this arena in use.
-                return false;
-            }
+        private void retire() {
+            released = true;
+            CALLBACKS.remove(context, this);
+            clearWindows();
         }
     }
 }
