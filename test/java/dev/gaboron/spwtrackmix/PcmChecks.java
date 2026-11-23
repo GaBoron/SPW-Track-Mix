@@ -65,11 +65,52 @@ final class PcmChecks {
             mixer.process(buffer, 0, 500, entry, window, original.withPreset(MixSettings.Preset.CUSTOM));
             require(buffer.getAtIndex(FLOAT, 998) == SOURCE, "default custom mix must be untouched");
         }
+        mixerControlChecks();
         loudnessChecks();
         spectrumChecks();
         cacheChecks();
         playbackSessionChecks();
         System.out.println("Mixer, loudness, cached PCM, source-positioned FFT and per-track resets verified.");
+    }
+
+    private static void mixerControlChecks() {
+        var custom = MixSettings.DEFAULT.withVolume(0, 64).withVolume(1, 117);
+        var muted = custom.withMuted(0);
+        require(muted.effectiveVolume(0) == 0 && (muted.muteMask() & 1) != 0,
+                "mute must zero the displayed fader");
+        require(muted.withMuted(0).effectiveVolume(0) == 64, "unmute must restore the trimmed level");
+        var raised = muted.withVolume(0, 90);
+        require(raised.effectiveVolume(0) == 90 && raised.muteMask() == 0,
+                "raising the fader must clear mute");
+
+        var lowered = custom.withVolume(1, 0);
+        require(lowered.effectiveVolume(1) == 0 && lowered.muteMask() == 2, "zero fader must select mute");
+        require(lowered.withMuted(1).effectiveVolume(1) == 117, "zero fader must remember the previous level");
+
+        var solo = custom.withSolo(0);
+        require(solo.effectiveVolume(0) == 64 && solo.effectiveVolume(1) == 0,
+                "solo must zero excluded faders");
+        var added = solo.withVolume(2, 42);
+        require(added.soloMask() == 5 && added.effectiveVolume(0) == 64 && added.effectiveVolume(2) == 42
+                && added.effectiveVolume(1) == 0, "raising an excluded fader must keep the other solos");
+        require(added.withMuted(2).effectiveVolume(2) == 0, "mute must override solo");
+        require(added.withSolo(2).withSolo(0).effectiveVolume(1) == 117,
+                "clearing solo must restore the filtered levels");
+
+        var backing = custom.withPreset(MixSettings.Preset.INSTRUMENTAL);
+        require(backing.muteMask() == 1 && backing.effectiveVolume(0) == 0 && backing.effectiveVolume(1) == 100,
+                "instrumental controls must reflect the preset");
+        require(backing.withPreset(MixSettings.Preset.CUSTOM).effectiveVolume(1) == 117,
+                "selecting custom must recall the previous custom edit");
+        var edited = backing.withVolume(2, 120);
+        require(edited.preset == MixSettings.Preset.CUSTOM && edited.effectiveVolume(0) == 0
+                && edited.effectiveVolume(1) == 100 && edited.effectiveVolume(2) == 120,
+                "editing a preset must preserve its other levels");
+
+        var vocals = custom.withPreset(MixSettings.Preset.VOCALS);
+        require(vocals.soloMask() == 1 && vocals.effectiveVolume(0) == 100 && vocals.effectiveVolume(1) == 0,
+                "vocal controls must reflect the preset");
+        require(vocals.withSolo(0).original(), "clearing the vocal solo at unity must restore the original");
     }
 
     private static void loudnessChecks() throws IOException {
@@ -236,9 +277,9 @@ final class PcmChecks {
     }
 
     private static void requireDefault(MixSettings mix, String context) {
-        require(mix.preset == MixSettings.Preset.ORIGINAL && mix.muted == 0 && mix.solos == 0, context);
+        require(mix.preset == MixSettings.Preset.ORIGINAL && mix.muteMask() == 0 && mix.soloMask() == 0, context);
         for (int lane = 0; lane < MixSettings.STEMS; lane++) {
-            require(mix.volume(lane) == 100, context + ": a fader retained its previous value");
+            require(mix.effectiveVolume(lane) == 100, context + ": a fader retained its previous value");
         }
     }
 

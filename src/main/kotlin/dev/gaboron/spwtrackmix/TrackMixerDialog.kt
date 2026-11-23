@@ -2,7 +2,14 @@
 
 package dev.gaboron.spwtrackmix
 
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.snap
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsDraggedAsState
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -26,10 +33,14 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.moriafly.salt.ui.Button
+import com.moriafly.salt.ui.BasicButton
 import com.moriafly.salt.ui.ButtonAppearance
+import com.moriafly.salt.ui.ButtonDefaults
 import com.moriafly.salt.ui.ButtonIntent
 import com.moriafly.salt.ui.ControlSize
 import com.moriafly.salt.ui.ItemDivider
@@ -165,19 +176,25 @@ private fun MixerBody(session: TrackMixSession, state: ScreenState, mix: MixSett
             if (index > 0) ItemDivider()
             val bit = 1 shl index
             Row(Modifier.fillMaxWidth().padding(end = 10.dp), verticalAlignment = Alignment.CenterVertically) {
-                val editLevel = { value: Float ->
-                    session.setMix { it.withVolume(index, value.roundToInt()) }
+                val interactions = remember { MutableInteractionSource() }
+                val dragging by interactions.collectIsDraggedAsState()
+                val pressing by interactions.collectIsPressedAsState()
+                val value = mix.effectiveVolume(index).toFloat()
+                val directlyManipulated = dragging || pressing
+                val animatedValue by animateFloatAsState(value, if (directlyManipulated) snap() else tween(180))
+                val displayed = if (directlyManipulated) value else animatedValue
+                ItemSlider(displayed, { level ->
+                    session.setMix { it.withVolume(index, level.roundToInt().coerceIn(0, 150)) }
                     update()
-                }
-                val value = mix.volume(index)
-                ItemSlider(value.toFloat(), editLevel, name, Modifier.weight(1f).alpha(if (ready) 1f else 0.68f),
-                    sub = "$value%", enabled = ready, valueRange = 0f..150f)
+                }, name, Modifier.weight(1f).alpha(if (ready) 1f else 0.68f),
+                    sub = "${displayed.roundToInt()}%", enabled = ready, valueRange = 0f..150f,
+                    interactionSource = interactions)
                 Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Toggle("静音", ready, mix.muted and bit != 0) {
+                    Toggle("静音", ready, mix.muteMask() and bit != 0) {
                         session.setMix { it.withMuted(index) }
                         update()
                     }
-                    Toggle("独奏", ready, mix.solos and bit != 0) {
+                    Toggle("独奏", ready, mix.soloMask() and bit != 0) {
                         session.setMix { it.withSolo(index) }
                         update()
                     }
@@ -246,8 +263,14 @@ private fun ModelAndCache(session: TrackMixSession, status: TrackMixSession.Stat
 
 @Composable
 private fun Toggle(text: String, enabled: Boolean, selected: Boolean, action: () -> Unit) {
-    Button(onClick = action, text = text, enabled = enabled, size = ControlSize.Small,
-        appearance = if (selected) ButtonAppearance.Filled else ButtonAppearance.Subtle)
+    val colors = ButtonDefaults.colors(appearance = if (selected) ButtonAppearance.Filled else ButtonAppearance.Subtle)
+    val background by animateColorAsState(colors.containerColor, tween(180))
+    val foreground by animateColorAsState(colors.contentColor, tween(180))
+    BasicButton(onClick = action, enabled = enabled, size = ControlSize.Small,
+        modifier = Modifier.semantics { this.selected = selected },
+        colors = colors.copy(containerColor = background, contentColor = foreground)) {
+        Text(text, maxLines = 1, overflow = TextOverflow.Ellipsis)
+    }
 }
 
 private fun jobLabel(stage: String): String = when (stage) {

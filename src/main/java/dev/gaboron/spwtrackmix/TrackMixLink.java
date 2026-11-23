@@ -64,7 +64,7 @@ public final class TrackMixLink implements AutoCloseable {
             boolean cached = selection != null && selection.entry() != null;
             var levels = new int[MixSettings.STEMS];
             for (int lane = 0; lane < levels.length; lane++) {
-                levels[lane] = mix.volume(lane);
+                levels[lane] = mix.effectiveVolume(lane);
             }
             return Map.ofEntries(
                     Map.entry("title", selection == null ? "" : selection.track().title()),
@@ -72,8 +72,8 @@ public final class TrackMixLink implements AutoCloseable {
                     Map.entry("ready", cached && state.attached()),
                     Map.entry("canSeparate", job == null && !cached && selection != null && selection.identity() != null),
                     Map.entry("levels", levels),
-                    Map.entry("muted", mix.muted),
-                    Map.entry("solos", mix.solos),
+                    Map.entry("muted", mix.muteMask()),
+                    Map.entry("solos", mix.soloMask()),
                     Map.entry("preset", mix.preset.ordinal()),
                     Map.entry("original", mix.original()),
                     Map.entry("busy", job != null),
