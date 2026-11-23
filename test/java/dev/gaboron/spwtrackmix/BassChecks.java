@@ -99,7 +99,7 @@ final class BassChecks {
         var buffer = arena.allocate(FRAMES * 8, 8);
         var settings = new AtomicReference<>(MixSettings.DEFAULT);
         var admitted = new AtomicReference<>(cache);
-        try (var effects = new BassSourceDsp(library, settings::get, admitted::get)) {
+        try (var effects = new BassSourceDsp(library, ignored -> settings.get(), admitted::get)) {
             require(!effects.attach(0, fixture), "invalid channel accepted");
             require(effects.attach(stream, fixture), "could not attach DSP");
             require(!effects.attach(stream, fixture), "duplicate DSP");
@@ -127,9 +127,7 @@ final class BassChecks {
             effects.prefetch(fixture, cache);
             pull(read, mix, buffer);
             check(buffer, jump + FRAMES, 500, 0, gain);
-            int prepared = 260_000;
-            require(effects.prepareSeek(stream, (long) prepared * sourceFrameBytes), "seek was not scheduled");
-            effects.prefetch(fixture, cache);
+            int prepared = jump + 22_050;
             seek(seek, stream, prepared, sourceFrameBytes);
             pull(read, mix, buffer);
             require(Math.abs(buffer.getAtIndex(JAVA_FLOAT, 0)) < .002f, "prepared seek used dry audio");
@@ -154,7 +152,7 @@ final class BassChecks {
             pull(read, mix, buffer);
             check(buffer, 1200, 0, -1);
         }
-        try (var effects = new BassSourceDsp(library, settings::get, admitted::get)) {
+        try (var effects = new BassSourceDsp(library, ignored -> settings.get(), admitted::get)) {
             require(effects.attach(stream, fixture), "replacement adapter could not attach");
             require((int) free.invokeExact(stream) != 0, "fixture stream could not be freed");
             int replacement = (int) create.invokeExact(0, name, 0L, 0L, flags);
@@ -188,7 +186,7 @@ final class BassChecks {
                 var stopping = new CountDownLatch(1);
                 var failure = new AtomicReference<Throwable>();
                 var mix = MixSettings.DEFAULT.withPreset(MixSettings.Preset.VOCALS);
-                try (var effects = new BassSourceDsp(library, () -> {
+                try (var effects = new BassSourceDsp(library, ignored -> {
                     entered.countDown();
                     try {
                         if (!resume.await(5, TimeUnit.SECONDS)) {

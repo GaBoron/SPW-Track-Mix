@@ -29,8 +29,7 @@ final class BassLibrary {
     private static final int CTYPE_DSD = 0x11700;
     private static final int DSP_FLOAT = 2;
     private static final int DSP_FREECALL = 4;
-    static final FunctionDescriptor DSP_PROC =
-            FunctionDescriptor.ofVoid(JAVA_INT, JAVA_INT, ADDRESS, JAVA_INT, ADDRESS);
+
     private static final Linker LINKER = Linker.nativeLinker();
 
     private final MethodHandle channelInfo;

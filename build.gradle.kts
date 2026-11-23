@@ -19,6 +19,8 @@ dependencies {
     implementation("io.github.moriafly:salt-ui:3.0.0-beta03")
     compileOnly("com.github.Moriafly.spw-workshop-api:spw-workshop-api:0.1.0-dev23") { isTransitive = false }
     compileOnly("org.pf4j:pf4j:3.12.0")
+    compileOnly("net.java.dev.jna:jna:5.18.1")
+    testRuntimeOnly("net.java.dev.jna:jna:5.18.1")
     compileOnly("org.jetbrains.kotlin:kotlin-stdlib:2.4.20")
 }
 
@@ -70,7 +72,8 @@ val pcmCheck = tasks.register<JavaExec>("pcmCheck") {
 val bassCheck = tasks.register<JavaExec>("bassCheck") {
     group = "verification"
     dependsOn(tasks.testClasses)
-    classpath = sourceSets.test.get().runtimeClasspath
+    val archive = providers.gradleProperty("spwArchive").orNull
+    classpath = files(archive ?: emptyList<Any>()) + sourceSets.test.get().runtimeClasspath
     mainClass = "dev.gaboron.spwtrackmix.BassChecks"
     jvmArgs("--enable-native-access=ALL-UNNAMED")
     providers.gradleProperty("bassDirectory").orNull?.let {

@@ -99,7 +99,7 @@ internal fun TrackMixerContent(session: TrackMixSession, dismiss: () -> Unit) {
                 update()
             }
         } else {
-            MixerBody(session, state, options.mix(), update) { manage = true }
+            MixerBody(session, state, state.status.mix(), update) { manage = true }
         }
     }
 }

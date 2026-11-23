@@ -8,7 +8,6 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
 import java.util.function.UnaryOperator;
@@ -16,9 +15,23 @@ import java.util.function.UnaryOperator;
 final class TrackMixSession implements AutoCloseable {
     private static final System.Logger LOG = System.getLogger(TrackMixSession.class.getName());
 
-    record Track(Path path, String title) {}
+    record Track(Path path, String title, String id) {
+        boolean sameSource(Track other) {
+            return other != null && path.equals(other.path) && id.equals(other.id);
+        }
+    }
+
     record Selection(Track track, StemCache.Identity identity, StemCache.Entry entry, String error) {}
-    record Status(Selection selection, boolean attached, Job job, String notice, long cacheBytes, boolean modelReady) {}
+    record Status(Selection selection, MixSettings mix, boolean attached, Job job, String notice, long cacheBytes,
+                  boolean modelReady) {}
+
+    private record Playback(Selection selection, MixSettings mix) {
+        private static final Playback EMPTY = new Playback(null, MixSettings.DEFAULT);
+
+        StemCache.Entry entry() {
+            return selection == null ? null : selection.entry;
+        }
+    }
 
     private final Path data;
     private final Path config;
@@ -31,11 +44,11 @@ final class TrackMixSession implements AutoCloseable {
             task -> thread(task, "Track Mix preload"));
     private final ExecutorService worker = Executors.newSingleThreadExecutor(task -> thread(task, "Track Mix worker"));
     private final AtomicLong cacheRevision = new AtomicLong();
-    private final AtomicBoolean seekPrefetchQueued = new AtomicBoolean();
     private final Object configurationLock = new Object();
     private volatile TrackMixOptions options;
     private TrackMixOptions saved;
-    private volatile Selection selection;
+    private final Object playbackLock = new Object();
+    private volatile Playback playback = Playback.EMPTY;
     private volatile Job job;
     private volatile boolean closed;
     private volatile boolean modelReady;
@@ -69,11 +82,9 @@ final class TrackMixSession implements AutoCloseable {
             if (!source.isAbsolute()) {
                 return;
             }
+            refreshSelection();
             if (effects == null) {
-                effects = new BassSourceDsp(bass(), () -> options.mix(), () -> {
-                    Selection current = selection;
-                    return current == null ? null : current.entry;
-                });
+                effects = new BassSourceDsp(bass(), this::mixFor, () -> playback.entry());
             }
             effects.attach(channel, source.normalize());
         } catch (Throwable error) {
@@ -93,9 +104,10 @@ final class TrackMixSession implements AutoCloseable {
     }
 
     Status status() {
-        Selection selected = selection;
+        Playback current = playback;
+        Selection selected = current.selection;
         var active = effects;
-        return new Status(selected, selected != null && active != null
+        return new Status(selected, current.mix, selected != null && active != null
                 && active.attached(selected.track.path, selected.entry), job, notice, cacheBytes, modelReady);
     }
 
@@ -104,9 +116,18 @@ final class TrackMixSession implements AutoCloseable {
     }
 
     void setMix(UnaryOperator<MixSettings> change) {
-        synchronized (configurationLock) {
-            options = options.withMix(change.apply(options.mix()));
+        synchronized (playbackLock) {
+            Selection before = playback.selection;
+            Selection current = refreshSelection();
+            if (before != null && current != null && before.track.sameSource(current.track)) {
+                playback = new Playback(current, change.apply(playback.mix));
+            }
         }
+    }
+
+    private MixSettings mixFor(StemCache.Entry entry) {
+        Playback current = playback;
+        return entry != null && current.entry() == entry ? current.mix : MixSettings.DEFAULT;
     }
 
     synchronized void setOptions(int limit, boolean quality, boolean cpu, boolean fp16) {
@@ -116,7 +137,7 @@ final class TrackMixSession implements AutoCloseable {
         boolean changedLimit;
         synchronized (configurationLock) {
             changedLimit = options.cacheGiB() != limit;
-            options = new TrackMixOptions(limit, quality, cpu, fp16, options.mix());
+            options = new TrackMixOptions(limit, quality, cpu, fp16);
         }
         if (changedLimit) {
             worker.execute(this::enforceLimit);
@@ -124,7 +145,7 @@ final class TrackMixSession implements AutoCloseable {
     }
 
     void separate() {
-        Selection selected = selection;
+        Selection selected = playback.selection;
         if (selected == null || selected.identity == null) {
             return;
         }
@@ -147,7 +168,7 @@ final class TrackMixSession implements AutoCloseable {
     }
 
     void clearCurrent() {
-        Selection selected = selection;
+        Selection selected = playback.selection;
         if (selected != null && selected.identity != null) {
             submit(selected.track.title, task -> {
                 bypassCurrent();
@@ -236,42 +257,72 @@ final class TrackMixSession implements AutoCloseable {
         }
     }
 
+    private Selection refreshSelection() {
+        synchronized (playbackLock) {
+            if (closed) {
+                return null;
+            }
+            Track now = currentTrack.get();
+            Selection previous = playback.selection;
+            if (now == null) {
+                playback = Playback.EMPTY;
+            } else if (previous == null || !now.sameSource(previous.track)) {
+                playback = new Playback(new Selection(now, null, null, ""), MixSettings.DEFAULT);
+            } else if (!now.equals(previous.track)) {
+                playback = new Playback(new Selection(now, previous.identity, previous.entry, previous.error), playback.mix);
+            }
+            return playback.selection;
+        }
+    }
+
+    private boolean publishSelection(Selection previous, Selection updated) {
+        synchronized (playbackLock) {
+            if (closed || playback.selection != previous) {
+                return false;
+            }
+            playback = new Playback(updated, playback.mix);
+            return true;
+        }
+    }
+
     private void poll() {
         if (closed) {
             return;
         }
         saveSettings();
+        Selection selected = playback.selection;
         try {
-            Track now = currentTrack.get();
-            var old = selection;
-            if (now == null) {
-                selection = null;
+            selected = refreshSelection();
+            if (selected == null) {
                 return;
             }
-            var id = old != null && old.track.path.equals(now.path) && old.identity != null
-                    && old.identity.current() ? old.identity : null;
+            Track track = selected.track;
+            StemCache.Identity identity = selected.identity;
             long revision = cacheRevision.get();
-            if (id != null && revision == seenCacheRevision && old.track.equals(now)) {
+            if (identity == null || !identity.current()) {
+                if (identity != null) {
+                    var pending = new Selection(track, null, null, "");
+                    if (!publishSelection(selected, pending)) {
+                        return;
+                    }
+                    selected = pending;
+                }
+                identity = StemCache.Identity.read(track.path);
+            } else if (revision == seenCacheRevision) {
                 return;
             }
-            if (id == null) {
-                selection = new Selection(now, null, null, "");
-                id = StemCache.Identity.read(now.path);
-            }
+            Selection result;
             try {
-                var entry = cache.lookup(id);
-                if (revision == cacheRevision.get() && !closed) {
-                    selection = new Selection(now, id, entry, "");
-                    seenCacheRevision = revision;
-                }
+                result = new Selection(track, identity, cache.lookup(identity), "");
             } catch (IOException error) {
-                selection = new Selection(now, id, null, display(error));
+                result = new Selection(track, identity, null, display(error));
+            }
+            if (revision == cacheRevision.get() && publishSelection(selected, result)) {
                 seenCacheRevision = revision;
             }
         } catch (Exception error) {
-            var old = selection;
-            if (old != null) {
-                selection = new Selection(old.track, null, null, display(error));
+            if (selected != null) {
+                publishSelection(selected, new Selection(selected.track, null, null, display(error)));
             }
         }
     }
@@ -288,32 +339,18 @@ final class TrackMixSession implements AutoCloseable {
         }
     }
 
-    void sourceSeeking(int channel, long position) {
-        var active = effects;
-        if (active == null || !active.prepareSeek(channel, position) || !seekPrefetchQueued.compareAndSet(false, true)) {
-            return;
-        }
-        try {
-            preloader.execute(() -> {
-                seekPrefetchQueued.set(false);
-                prefetch();
-            });
-        } catch (java.util.concurrent.RejectedExecutionException stopped) {
-            seekPrefetchQueued.set(false);
-        }
-    }
 
     private void prefetch() {
         var active = effects;
-        var current = selection;
+        var current = playback.selection;
         if (active == null) {
             return;
         }
         try {
             active.prefetch(current == null ? null : current.track.path, current == null ? null : current.entry);
         } catch (IOException error) {
-            if (current != null && selection == current) {
-                selection = new Selection(current.track, current.identity, null, display(error));
+            if (current != null) {
+                publishSelection(current, new Selection(current.track, current.identity, null, display(error)));
             }
         }
     }
@@ -333,9 +370,9 @@ final class TrackMixSession implements AutoCloseable {
     }
 
     private void bypassCurrent() {
-        var selected = selection;
+        var selected = playback.selection;
         if (selected != null) {
-            selection = new Selection(selected.track, selected.identity, null, "");
+            publishSelection(selected, new Selection(selected.track, selected.identity, null, ""));
         }
         var active = effects;
         if (active != null) {

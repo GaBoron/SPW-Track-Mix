@@ -1,16 +1,19 @@
 package dev.gaboron.spwtrackmix;
 
+import com.sun.jna.Callback;
+import com.sun.jna.CallbackReference;
+import com.sun.jna.CallbackThreadInitializer;
+import com.sun.jna.Native;
+import com.sun.jna.Pointer;
+
 import java.io.IOException;
-import java.lang.foreign.Arena;
-import java.lang.foreign.Linker;
 import java.lang.foreign.MemorySegment;
-import java.lang.invoke.MethodHandles;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Function;
 import java.util.function.Supplier;
 
 final class BassSourceDsp implements AutoCloseable {
@@ -18,29 +21,28 @@ final class BassSourceDsp implements AutoCloseable {
     private static final Registration[] NONE = {};
     private static final AtomicLong NEXT_CONTEXT = new AtomicLong();
     private static final ConcurrentHashMap<Long, Registration> CALLBACKS = new ConcurrentHashMap<>();
-    // A free notification runs inside the native trampoline. Keep one trampoline alive
-    // for the process and retire each registration by its non-reused context token.
-    private static final MemorySegment CALLBACK = createCallback();
+    // The host already uses JNA on BASS-owned threads. Keep the callback strongly
+    // reachable for the plugin class loader and retire only the per-source context.
+    private static final DspCallback CALLBACK = BassSourceDsp::onNativeBlock;
+    private static final MemorySegment CALLBACK_ENTRY = callbackEntry();
 
-    private static MemorySegment createCallback() {
-        try {
-            var target = MethodHandles.lookup().findStatic(BassSourceDsp.class, "onNativeBlock",
-                    BassLibrary.DSP_PROC.toMethodType());
-            return Linker.nativeLinker().upcallStub(target, BassLibrary.DSP_PROC, Arena.global());
-        } catch (ReflectiveOperationException error) {
-            throw new ExceptionInInitializerError(error);
-        }
+    public interface DspCallback extends Callback {
+        void callback(int effect, int channel, Pointer buffer, int length, Pointer context);
     }
 
-    private static void onNativeBlock(int effect, int channel, MemorySegment buffer, int length, MemorySegment context) {
+    private static MemorySegment callbackEntry() {
+        Native.setCallbackThreadInitializer(CALLBACK, new CallbackThreadInitializer(true, false, "Track Mix DSP"));
+        return MemorySegment.ofAddress(Pointer.nativeValue(CallbackReference.getFunctionPointer(CALLBACK)));
+    }
+
+    private static void onNativeBlock(int effect, int channel, Pointer buffer, int length, Pointer context) {
         Registration registration = null;
         try {
-            registration = CALLBACKS.get(context.address());
+            registration = CALLBACKS.get(Pointer.nativeValue(context));
             if (registration != null) {
-                registration.onBlock(channel, buffer, length);
+                registration.onBlock(channel, Pointer.nativeValue(buffer), length);
             }
         } catch (Throwable error) {
-            // Throwing through an FFM upcall terminates the JVM.
             if (registration != null) {
                 registration.bypassed = true;
             }
@@ -48,13 +50,13 @@ final class BassSourceDsp implements AutoCloseable {
     }
 
     private final BassLibrary library;
-    private final Supplier<MixSettings> settings;
+    private final Function<StemCache.Entry, MixSettings> settings;
     private final Supplier<StemCache.Entry> admitted;
     private final List<Registration> registrations = new ArrayList<>();
     private volatile Registration[] forPrefetch = NONE;
     private boolean closed;
 
-    BassSourceDsp(BassLibrary library, Supplier<MixSettings> settings, Supplier<StemCache.Entry> admitted) {
+    BassSourceDsp(BassLibrary library, Function<StemCache.Entry, MixSettings> settings, Supplier<StemCache.Entry> admitted) {
         this.library = library;
         this.settings = settings;
         this.admitted = admitted;
@@ -82,7 +84,7 @@ final class BassSourceDsp implements AutoCloseable {
         CALLBACKS.put(registration.context, registration);
         registrations.add(registration);
         try {
-            registration.dsp = library.addDsp(channel, CALLBACK, MemorySegment.ofAddress(registration.context));
+            registration.dsp = library.addDsp(channel, CALLBACK_ENTRY, MemorySegment.ofAddress(registration.context));
             return registration.dsp != 0 && !registration.released;
         } finally {
             if (registration.dsp == 0 || registration.released) {
@@ -104,27 +106,10 @@ final class BassSourceDsp implements AutoCloseable {
         }
     }
 
-    boolean prepareSeek(int channel, long bytePosition) {
-        StemCache.Entry current = admitted.get();
-        if (current == null || settings.get().original()) {
-            return false;
-        }
-        for (Registration registration : forPrefetch) {
-            if (registration.channel == channel && !registration.released
-                    && registration.selected == current) {
-                long frame = bytePosition / registration.format.frameBytes();
-                if (bytePosition >= 0 && frame < current.frames()) {
-                    registration.requestedFrame.set((int) frame);
-                    return true;
-                }
-            }
-        }
-        return false;
-    }
 
     Object[] spectrum(Path path, long positionMs) {
         var entry = admitted.get();
-        if (entry == null || settings.get().original()) {
+        if (entry == null || settings.apply(entry).original()) {
             return null;
         }
         for (Registration registration : forPrefetch) {
@@ -180,10 +165,8 @@ final class BassSourceDsp implements AutoCloseable {
         private volatile int decodedFrame;
         private volatile StemCache.Window window;
         private volatile StemCache.Window openingWindow;
-        private volatile StemCache.Window seekWindow;
         private volatile StemCache.Entry selected;
         private volatile MixedSpectrum spectrum;
-        private final AtomicInteger requestedFrame = new AtomicInteger(-1);
 
         private Registration(int channel, Path path, AudioFormat format) {
             this.channel = channel;
@@ -195,10 +178,8 @@ final class BassSourceDsp implements AutoCloseable {
         private void clearWindows() {
             window = null;
             openingWindow = null;
-            seekWindow = null;
             selected = null;
             spectrum = null;
-            requestedFrame.set(-1);
         }
 
         private void loadWindow(StemCache.Entry entry) throws IOException {
@@ -206,19 +187,9 @@ final class BassSourceDsp implements AutoCloseable {
                 spectrum = new MixedSpectrum(entry.rate());
             }
             selected = entry;
-            int request = requestedFrame.getAndSet(-1);
-            if (request >= 0) {
-                if (!covers(window, entry, request, usableAhead(entry, request))
-                        && !covers(openingWindow, entry, request, usableAhead(entry, request))
-                        && !covers(seekWindow, entry, request, usableAhead(entry, request))) {
-                    seekWindow = readWindow(entry, request);
-                }
-            }
             int frame = decodedFrame;
             int ahead = usableAhead(entry, frame);
-            if (covers(seekWindow, entry, frame, ahead)) {
-                window = seekWindow;
-            } else if (covers(openingWindow, entry, frame, ahead)) {
+            if (covers(openingWindow, entry, frame, ahead)) {
                 window = openingWindow;
             } else if (!covers(window, entry, frame, ahead) && frame < entry.frames()) {
                 window = readWindow(entry, frame);
@@ -248,17 +219,14 @@ final class BassSourceDsp implements AutoCloseable {
             if (covers(ready, entry, frame, frames)) {
                 return ready;
             }
-            var seek = seekWindow;
-            if (covers(seek, entry, frame, frames)) {
-                return seek;
-            }
+
             var beginning = openingWindow;
             return covers(beginning, entry, frame, frames) ? beginning : null;
         }
 
-        private void onBlock(int source, MemorySegment buffer, int length) throws Throwable {
+        private void onBlock(int source, long buffer, int length) throws Throwable {
             // A null buffer indicates that BASS has removed the DSP or freed the source.
-            if (buffer.address() == 0) {
+            if (buffer == 0) {
                 retire();
                 return;
             }
@@ -280,8 +248,8 @@ final class BassSourceDsp implements AutoCloseable {
             if (entry != selected) {
                 entry = null;
             }
-            var pcm = buffer.reinterpret(length);
-            if (mixer.process(pcm, frame, frames, entry, windowAt(entry, frame, frames), settings.get())) {
+            var pcm = MemorySegment.ofAddress(buffer).reinterpret(length);
+            if (mixer.process(pcm, frame, frames, entry, windowAt(entry, frame, frames), settings.apply(entry))) {
                 var tap = spectrum;
                 if (tap != null) {
                     tap.write(pcm, (int) frame, frames);

@@ -22,7 +22,6 @@ public final class TrackMixPlugin extends SpwPlugin {
     private static volatile TrackMixHostUi mixerWindow;
 
     private HookHandle streamHook;
-    private HookHandle seekHook;
     private TrackMixSession session;
     private TrackMixLink link;
     private TrackMixHostUi window;
@@ -76,18 +75,7 @@ public final class TrackMixPlugin extends SpwPlugin {
                             }
                         }
                     });
-            seekHook = WorkshopApi.hookRegistrar().hookMethod("com.xuncorp.pisces.bass.impl.BassMixImpl",
-                    "\u037f", List.of("int", "long", "int"), new MethodHook() {
-                        @Override
-                        public void before(MethodHookParam call) {
-                            Object[] args = call.getArgs();
-                            int mode = (int) args[2];
-                            // This binding uses absolute byte positions. These two flags control mixer buffering.
-                            if ((mode & ~(0x10000 | 0x800000)) == 0) {
-                                created.sourceSeeking((int) args[0], (long) args[1]);
-                            }
-                        }
-                    });
+
             window = new TrackMixHostUi(created);
             window.install();
             created.start();
@@ -96,10 +84,9 @@ public final class TrackMixPlugin extends SpwPlugin {
             mixerWindow = window;
         } catch (RuntimeException | Error error) {
             try {
-                closeAudioHooks(streamHook, seekHook);
+                unhookAudio(streamHook);
             } finally {
                 streamHook = null;
-                seekHook = null;
                 try {
                     if (window != null) {
                         window.close();
@@ -122,7 +109,7 @@ public final class TrackMixPlugin extends SpwPlugin {
             Path path = Path.of(track.getPath()).normalize();
             if (path.isAbsolute() && path.getFileName() != null) {
                 String title = track.getTitle().isBlank() ? path.getFileName().toString() : track.getTitle();
-                return new TrackMixSession.Track(path, title);
+                return new TrackMixSession.Track(path, title, track.getId());
             }
         } catch (InvalidPathException ignored) {
             // URI-backed and external playback do not have a native local file stream.
@@ -133,15 +120,12 @@ public final class TrackMixPlugin extends SpwPlugin {
     @Override
     public void stop() {
         HookHandle hook;
-        HookHandle seek;
         TrackMixSession active;
         TrackMixLink oldLink;
         TrackMixHostUi oldWindow;
         synchronized (this) {
             hook = streamHook;
             streamHook = null;
-            seek = seekHook;
-            seekHook = null;
             active = session;
             session = null;
             oldLink = link;
@@ -154,7 +138,7 @@ public final class TrackMixPlugin extends SpwPlugin {
         }
 
         try {
-            closeAudioHooks(hook, seek);
+            unhookAudio(hook);
         } finally {
             try {
                 if (oldWindow != null) {
@@ -174,15 +158,9 @@ public final class TrackMixPlugin extends SpwPlugin {
         }
     }
 
-    private static void closeAudioHooks(HookHandle source, HookHandle seek) {
-        try {
-            if (seek != null) {
-                seek.unhook();
-            }
-        } finally {
-            if (source != null) {
-                source.unhook();
-            }
+    private static void unhookAudio(HookHandle source) {
+        if (source != null) {
+            source.unhook();
         }
     }
 

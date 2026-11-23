@@ -59,7 +59,7 @@ public final class TrackMixLink implements AutoCloseable {
         public Map<String, Object> getState() {
             var state = session.status();
             var selection = state.selection();
-            var mix = session.options().mix();
+            var mix = state.mix();
             var job = state.job();
             boolean cached = selection != null && selection.entry() != null;
             var levels = new int[MixSettings.STEMS];

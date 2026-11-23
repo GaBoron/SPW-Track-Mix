@@ -10,13 +10,16 @@ import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.Properties;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 final class PcmChecks {
     private static final ValueLayout.OfFloat FLOAT = ValueLayout.JAVA_FLOAT_UNALIGNED;
     private static final float SOURCE = 0.25f;
     private static final int FRAMES = 1700;
 
-    public static void main(String[] args) throws IOException {
+    public static void main(String[] args) throws Exception {
         try (var arena = Arena.ofConfined()) {
             var samples = new float[FRAMES * StemCache.FLOATS_PER_FRAME];
             for (int frame = 0; frame < FRAMES; frame++) {
@@ -65,7 +68,8 @@ final class PcmChecks {
         loudnessChecks();
         spectrumChecks();
         cacheChecks();
-        System.out.println("Mixer, loudness, cached PCM and source-positioned FFT verified.");
+        playbackSessionChecks();
+        System.out.println("Mixer, loudness, cached PCM, source-positioned FFT and per-track resets verified.");
     }
 
     private static void loudnessChecks() throws IOException {
@@ -162,6 +166,79 @@ final class PcmChecks {
             require(!identity.digest().equals(StemCache.Identity.read(source).digest()), "source checksum did not change");
         } finally {
             WindowsRecycle.recycle(directory);
+        }
+    }
+
+    private static void playbackSessionChecks() throws Exception {
+        Path directory = Files.createTempDirectory("spw-track-mix-session-check-").toAbsolutePath().normalize();
+        try {
+            Path config = Files.writeString(directory.resolve("settings.properties"),
+                    "cacheGiB=23\nquality=true\ncpu=true\npreset=VOCALS\nsolo=8\nmute=1\ntrack.3=65\n");
+            Path firstPath = Files.writeString(directory.resolve("first"), "test audio source");
+            Path secondPath = Files.writeString(directory.resolve("second"), "second test audio source");
+            var first = new TrackMixSession.Track(firstPath, "First", "a");
+            var second = new TrackMixSession.Track(secondPath, "Second", "b");
+            var selected = new AtomicReference<>(first);
+            var mix = MixSettings.DEFAULT.withVolume(3, 65).withMuted(1).withSolo(3);
+            var preferences = new TrackMixOptions(24, true, true, true);
+            try (var session = new TrackMixSession(directory, selected::get)) {
+                require(session.options().equals(new TrackMixOptions(23, true, true, false)),
+                        "legacy mix did not preserve cache and inference preferences");
+                session.start();
+                requireDefault(awaitTrack(session, first).mix(), "fresh startup with an old preset");
+                session.setMix(ignored -> mix);
+                require(session.status().mix() == mix, "mixer settings were not applied to the current track");
+
+                var retitled = new TrackMixSession.Track(firstPath, "Retitled", "a");
+                selected.set(retitled);
+                require(awaitTrack(session, retitled).mix() == mix, "metadata refresh reset the same track");
+                selected.set(second);
+                requireDefault(awaitTrack(session, second).mix(), "switch to the second track");
+                session.setMix(ignored -> mix);
+                selected.set(first);
+                requireDefault(awaitTrack(session, first).mix(), "return to the first track");
+
+                session.setMix(ignored -> mix);
+                var anotherItem = new TrackMixSession.Track(firstPath, "Another queue item", "c");
+                selected.set(anotherItem);
+                requireDefault(awaitTrack(session, anotherItem).mix(), "switch between IDs that share a file");
+
+                session.setMix(ignored -> mix);
+                session.setOptions(preferences.cacheGiB(), preferences.quality(), preferences.cpu(), preferences.fp16());
+            }
+
+            var saved = new Properties();
+            try (var stream = Files.newInputStream(config)) {
+                saved.load(stream);
+            }
+            require(saved.size() == 4 && !saved.containsKey("preset"), "configuration still contains mixer state");
+            try (var restarted = new TrackMixSession(directory, selected::get)) {
+                require(restarted.options().equals(preferences), "cache or inference preferences were lost");
+                requireDefault(restarted.status().mix(), "restart after editing the mixer");
+            }
+        } finally {
+            WindowsRecycle.recycle(directory);
+        }
+    }
+
+    private static TrackMixSession.Status awaitTrack(TrackMixSession session, TrackMixSession.Track expected)
+            throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        do {
+            var status = session.status();
+            if (status.selection() != null && expected.equals(status.selection().track())
+                    && status.selection().identity() != null) {
+                return status;
+            }
+            Thread.sleep(10);
+        } while (System.nanoTime() < deadline);
+        throw new AssertionError("test song did not become current: " + expected.title());
+    }
+
+    private static void requireDefault(MixSettings mix, String context) {
+        require(mix.preset == MixSettings.Preset.ORIGINAL && mix.muted == 0 && mix.solos == 0, context);
+        for (int lane = 0; lane < MixSettings.STEMS; lane++) {
+            require(mix.volume(lane) == 100, context + ": a fader retained its previous value");
         }
     }
 
