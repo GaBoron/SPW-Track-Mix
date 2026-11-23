@@ -18,16 +18,21 @@ final class HostBindingChecks {
         try (var archive = new ZipFile(args[0]);
              var session = new TrackMixSession(Path.of(args[0]).getParent().resolve("unused-track-mix-check"), () -> null);
              var ui = new TrackMixHostUi(session)) {
-            var entry = archive.getEntry("androidx/compose/ui/\u024e.class");
+            var navigation = ui.getNavigation();
+            String owner = navigation.getDeclaringClass().getName().replace('.', '/');
+            String descriptor = MethodType.methodType(navigation.getReturnType(), navigation.getParameterTypes())
+                    .toMethodDescriptorString();
+            String caller = ui.getNavigationCaller().getName().replace('.', '/');
+            var entry = archive.getEntry(caller + ".class");
             PcmChecks.require(entry != null, "native navigation caller missing");
             try (var stream = archive.getInputStream(entry)) {
                 var model = ClassFile.of().parse(stream.readAllBytes());
                 long sites = model.methods().stream().flatMap(method -> method.code().stream())
                         .flatMap(code -> code.elementList().stream())
                         .filter(element -> element instanceof InvokeInstruction invoke
-                                && invoke.owner().asInternalName().equals("com/xuncorp/voxzen/ui/navigation/AppNavigationKt")
-                                && invoke.name().equalsString("AppNavigation")
-                                && invoke.type().equalsString("(Landroidx/compose/runtime/Composer;I)V"))
+                                && invoke.owner().asInternalName().equals(owner)
+                                && invoke.name().equalsString(navigation.getName())
+                                && invoke.type().equalsString(descriptor))
                         .count();
                 PcmChecks.require(sites == 1, "native navigation hook call must be unique");
             }

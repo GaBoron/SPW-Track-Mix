@@ -26,6 +26,9 @@ internal class TrackMixHostUi(private val session: TrackMixSession) : AutoClosea
     private val loader = WorkshopApi::class.java.classLoader
     private val handles = ArrayList<HookHandle>(2)
     private val theme = HostPalette(loader)
+    val navigation = resolve(loader, "com.xuncorp.voxzen.ui.navigation.AppNavigationKt", "AppNavigation",
+        "(Landroidx/compose/runtime/Composer;I)V")
+    val navigationCaller = Class.forName("androidx.compose.ui.\u024e", false, loader)
     private val builder = resolve(loader, "androidx.compose.ui.\u0266", "\u037f",
         "(Lcom/xuncorp/voxzen/data/entity/Track;Lcom/xuncorp/pisces/PiscesMediaItem;" +
             "Landroidx/compose/ui/\u05dc;Lcom/xuncorp/voxzen/ui/navigation/Navigator;" +
@@ -43,8 +46,8 @@ internal class TrackMixHostUi(private val session: TrackMixSession) : AutoClosea
         try {
             val registry = WorkshopApi.hookRegistrar
             handles += registry.afterComposable(
-                "com.xuncorp.voxzen.ui.navigation.AppNavigation", "AppNavigation",
-                "androidx.compose.ui.\u024e", parameterTypes = emptyList()
+                navigation.declaringClass.name, navigation.name,
+                navigationCaller.name, parameterTypes = emptyList()
             ) {
                 if (visible && !closed) {
                     theme.Content {
