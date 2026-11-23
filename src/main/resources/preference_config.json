@@ -1,0 +1,15 @@
+{
+  "configs": [
+    {
+      "title": "SPW Track Mix",
+      "preferences": [
+        {
+          "type": "button",
+          "title": "打开六轨调音台",
+          "on_click": "dev.gaboron.spwtrackmix.TrackMixPlugin.openMixer",
+          "arrow_type": "none"
+        }
+      ]
+    }
+  ]
+}

@@ -1,95 +1,116 @@
 package dev.gaboron.spwtrackmix;
 
+import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.channels.FileChannel;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 
 final class PcmChecks {
     private static final ValueLayout.OfFloat FLOAT = ValueLayout.JAVA_FLOAT_UNALIGNED;
-    private static final int[] TONES = {180, 250, 350, 490, 690, 970};
+    private static final float SOURCE = 0.25f;
+    private static final int FRAMES = 1700;
 
-    public static void main(String[] args) {
+    public static void main(String[] args) throws IOException {
         try (var arena = Arena.ofConfined()) {
-            int count = 1024;
-            var buffer = arena.allocate(count * ProbeSignal.FLOAT_FRAME_BYTES, Float.BYTES);
-            for (int section = 0; section < 8; section++) {
-                int start = section * ProbeSignal.SAMPLE_RATE + 907;
-                fill(buffer, start, count);
-                require(ProbeSignal.process(buffer, start, count), "valid block rejected");
-                checkOutput(buffer, start, count);
-            }
-
-            int start = ProbeSignal.SAMPLE_RATE - 196;
-            fill(buffer, start, count);
-            require(ProbeSignal.process(buffer, start, count), "transition block rejected");
-            checkOutput(buffer, start, count);
-
-            fill(buffer, start, count);
-            buffer.setAtIndex(FLOAT, count * 2 - 1, Float.NaN);
-            var original = buffer.toArray(ValueLayout.JAVA_BYTE);
-            require(!ProbeSignal.process(buffer, start, count), "unrelated block accepted");
-            require(java.util.Arrays.equals(original, buffer.toArray(ValueLayout.JAVA_BYTE)),
-                    "failed identity check touched part of the block");
-            require(!ProbeSignal.process(buffer, -1, count), "negative position accepted");
-            require(!ProbeSignal.process(buffer, ProbeSignal.FRAME_COUNT - 1, count), "end overrun accepted");
-        }
-        System.out.println("PCM probe verified: six solos, fades, exact bypass, wrong PCM and invalid positions.");
-    }
-
-    private static void fill(MemorySegment buffer, int startFrame, int frames) {
-        for (int frame = 0; frame < frames; frame++) {
-            for (int channel = 0; channel < 2; channel++) {
-                buffer.setAtIndex(FLOAT, frame * 2 + channel, original(startFrame + frame, channel));
-            }
-        }
-    }
-
-    static void checkOutput(MemorySegment buffer, int startFrame, int frames) {
-        for (int frame = 0; frame < frames; frame++) {
-            int position = startFrame + frame;
-            int section = position / 44100;
-            int offset = position % 44100;
-            for (int channel = 0; channel < 2; channel++) {
-                float expected = sampleForSection(section, position, channel);
-                if (section != 0 && offset < 441) {
-                    float previous = sampleForSection(section - 1, position, channel);
-                    expected = (expected * offset + previous * (441 - offset)) / 441;
-                }
-                float actual = buffer.getAtIndex(FLOAT, frame * 2 + channel);
-                if (!(Math.abs(actual - expected) <= 1e-7f)) {
-                    throw new AssertionError("Frame " + position + " channel " + channel
-                            + " expected " + expected + " but got " + actual);
+            var samples = new float[FRAMES * StemCache.FLOATS_PER_FRAME];
+            for (int frame = 0; frame < FRAMES; frame++) {
+                for (int lane = 0; lane < MixSettings.STEMS; lane++) {
+                    int start = frame * StemCache.FLOATS_PER_FRAME + lane * 2;
+                    samples[start] = 0.05f * (lane + 1);
+                    samples[start + 1] = -samples[start];
                 }
             }
+            var entry = new StemCache.Entry(Path.of("fixture"), 44100, FRAMES, 0,
+                    new float[]{0.05f, 0.10f, 0.15f, 0.20f, 0.25f, 0.30f});
+            var window = new StemCache.Window(entry, 0, samples);
+            var buffer = arena.allocate(500 * AudioFormat.FLOAT_FRAME_BYTES);
+            var mixer = new RealtimeStemMixer(44100);
+            var original = MixSettings.DEFAULT;
+
+            fill(buffer, SOURCE);
+            mixer.process(buffer, 0, 500, window, original);
+            near(buffer.getAtIndex(FLOAT, 995), SOURCE, "original is exact");
+
+            var vocals = original.withPreset(MixSettings.Preset.VOCALS);
+            mixer.process(buffer, 500, 500, window, vocals);
+            near(buffer.getAtIndex(FLOAT, 0), SOURCE + (0.05f - SOURCE) / 441, "vocal fade starts");
+            near(buffer.getAtIndex(FLOAT, 998), 0.05f, "vocals only");
+            near(buffer.getAtIndex(FLOAT, 999), -0.05f, "stereo preserved");
+
+            var custom = original.withVolume(1, 125).withSolo(0).withSolo(1).withMuted(0);
+            fill(buffer, SOURCE);
+            mixer.process(buffer, 1000, 500, window, custom);
+            near(buffer.getAtIndex(FLOAT, 998), 0.125f, "mute overrides multiple solos and gain adjusts");
+            var accompaniment = original.withPreset(MixSettings.Preset.INSTRUMENTAL);
+            fill(buffer, SOURCE);
+            mixer.process(buffer, 0, 500, window, accompaniment);
+            near(buffer.getAtIndex(FLOAT, 998), 0.995f, "fixed headroom prevents clipping");
+
+            fill(buffer, SOURCE);
+            mixer.process(buffer, 1000, 500, null, custom);
+            near(buffer.getAtIndex(FLOAT, 998), SOURCE, "missing window is dry");
+            mixer.process(buffer, 0, 500, window, original.withPreset(MixSettings.Preset.CUSTOM));
+            require(buffer.getAtIndex(FLOAT, 998) == SOURCE, "default custom mix must be untouched");
         }
+        cacheChecks();
+        System.out.println("Mixer and cache verified: presets, multiple solos, ramps, headroom, original bypass and corruption.");
     }
 
-    static void checkOriginal(MemorySegment buffer, int startFrame, int frames) {
-        for (int frame = 0; frame < frames; frame++) {
-            for (int channel = 0; channel < 2; channel++) {
-                require(buffer.getAtIndex(FLOAT, frame * 2 + channel) == original(startFrame + frame, channel),
-                        "original block changed");
+    private static void cacheChecks() throws IOException {
+        Path directory = Files.createTempDirectory("spw-track-mix-cache-check-").toAbsolutePath().normalize();
+        try {
+            Path source = Files.writeString(directory.resolve("track"), "first source");
+            Path other = Files.writeString(directory.resolve("other"), "second source");
+            Path raw = directory.resolve("six.f32");
+            var data = ByteBuffer.allocate(FRAMES * StemCache.BYTES_PER_FRAME).order(ByteOrder.LITTLE_ENDIAN);
+            while (data.hasRemaining()) {
+                data.putFloat(0.125f);
             }
+            Files.write(raw, data.array());
+            Path cacheDir = directory.resolve("cache");
+            Path retired = Files.createDirectory(directory.resolve("retired"));
+            var cache = new StemCache(cacheDir, path -> Files.move(path, retired.resolve(path.getFileName())));
+            var identity = StemCache.Identity.read(source);
+            var entry = cache.publish(identity, 48000, FRAMES, raw, directory, Long.MAX_VALUE);
+            require(cache.lookup(identity).crc() == entry.crc(), "cached data not reused");
+            var window = StemCache.readWindow(entry, 102, 100);
+            require(window.covers(102, 100) && !window.covers(101, 100), "window seek bounds");
+            require(window.samples()[1199] == 0.125f && entry.peak(5) == 0.125f, "PCM lost precision");
+            long size = cache.size();
+            var second = cache.publish(StemCache.Identity.read(other), 48000, FRAMES, raw, directory, size);
+            require(cache.size() == size && cache.lookup(identity) == null, "old cache not evicted");
+            try (var file = FileChannel.open(second.path(), StandardOpenOption.WRITE)) {
+                file.position(file.size() - 1);
+                file.write(ByteBuffer.wrap(new byte[]{-1}));
+            }
+            try {
+                cache.lookup(StemCache.Identity.read(other));
+                throw new AssertionError("corruption accepted");
+            } catch (IOException expected) {
+                require(expected.getMessage() != null, "corruption reason missing");
+            }
+            Files.writeString(source, "changed source");
+            require(!identity.current(), "source rewrite not recognized");
+            require(!identity.digest().equals(StemCache.Identity.read(source).digest()), "source checksum did not change");
+        } finally {
+            WindowsRecycle.recycle(directory);
         }
     }
 
-    private static float original(int frame, int channel) {
-        int sample = 0;
-        for (int frequency : TONES) {
-            sample += tone(frequency, frame, channel);
+    private static void fill(MemorySegment memory, float value) {
+        for (long index = 0; index < memory.byteSize() / Float.BYTES; index++) {
+            memory.setAtIndex(FLOAT, index, value);
         }
-        return sample / 32768f;
     }
 
-    private static float sampleForSection(int section, int frame, int channel) {
-        return section == 0 || section == 7
-                ? original(frame, channel)
-                : tone(TONES[section - 1], frame, channel) / 32768f;
-    }
-
-    private static long tone(int frequency, int frame, int channel) {
-        double phase = (frame % 4410) / 44100.0 * (2 * Math.PI * frequency) + channel * Math.PI / 4;
-        return Math.round(Math.sin(phase) * 1024);
+    static void near(float actual, float expected, String label) {
+        require(Math.abs(actual - expected) <= 3.1e-5f, label + ": expected " + expected + ", actual " + actual);
     }
 
     static void require(boolean value, String message) {

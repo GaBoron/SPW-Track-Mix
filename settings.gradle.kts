@@ -1,6 +1,7 @@
 pluginManagement {
     repositories {
         maven("https://jitpack.io")
+        maven("https://maven-central.storage-download.googleapis.com/maven2/")
         gradlePluginPortal()
         mavenCentral()
     }
@@ -15,6 +16,8 @@ pluginManagement {
 
 dependencyResolutionManagement {
     repositories {
+        google { content { includeGroupByRegex("androidx\\..*") } }
+        maven("https://maven-central.storage-download.googleapis.com/maven2/")
         mavenCentral()
         maven("https://jitpack.io")
     }

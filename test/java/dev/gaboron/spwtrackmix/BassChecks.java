@@ -3,14 +3,21 @@ package dev.gaboron.spwtrackmix;
 import java.lang.foreign.Arena;
 import java.lang.foreign.FunctionDescriptor;
 import java.lang.foreign.Linker;
+import java.lang.foreign.MemoryLayout;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.SymbolLookup;
 import java.lang.invoke.MethodHandle;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.concurrent.atomic.AtomicReference;
 
+import static dev.gaboron.spwtrackmix.PcmChecks.near;
 import static dev.gaboron.spwtrackmix.PcmChecks.require;
 import static java.lang.foreign.ValueLayout.ADDRESS;
+import static java.lang.foreign.ValueLayout.JAVA_FLOAT;
 import static java.lang.foreign.ValueLayout.JAVA_INT;
 import static java.lang.foreign.ValueLayout.JAVA_LONG;
 
@@ -20,12 +27,14 @@ final class BassChecks {
     private static final int UNICODE = 0x80000000;
     private static final int LOOP = 4;
     private static final int NO_RAMP = 0x800000;
-    private static final int PULL_FRAMES = 711;
+    private static final int PAUSED = 0x20000;
+    private static final int FRAMES = 711;
     private static final Linker LINKER = Linker.nativeLinker();
 
     public static void main(String[] args) throws Throwable {
         Path resources = Path.of(args[0]).toAbsolutePath();
         Path fixture = Path.of(args[1]).toAbsolutePath();
+        Path workspace = Files.createTempDirectory("spw-track-mix-bass-check-").toAbsolutePath().normalize();
         try (var arena = Arena.ofConfined()) {
             var bassPath = resources.resolve("bass.dll");
             var bass = SymbolLookup.libraryLookup(bassPath, arena);
@@ -35,22 +44,46 @@ final class BassChecks {
                     "BASS could not initialize its no-sound device");
             try {
                 var library = BassLibrary.resolveLoaded(bassPath);
-                exercise(bass, mixer, library, fixture, arena, FLOAT, 8);
-                exercise(bass, mixer, library, fixture, arena, 0, 4);
+                Path pcm = workspace.resolve("decoded.f32");
+                AudioFormat decoded = library.decode(fixture, pcm, Long.MAX_VALUE, progress -> {});
+                require(decoded.rate() == 44100 && decoded.frames() == ProbeSignal.FRAME_COUNT
+                        && Files.size(pcm) == ProbeSignal.FRAME_COUNT * 8L, "isolated decode lost frames");
+                var entry = fixtureCache(fixture, workspace);
+                exercise(bass, mixer, library, fixture, entry, arena, FLOAT, 8);
+                exercise(bass, mixer, library, fixture, entry, arena, 0, 4);
             } finally {
                 var free = bind(bass, "BASS_Free", JAVA_INT);
                 require((int) free.invokeExact() != 0, "BASS could not release its no-sound device");
             }
+        } finally {
+            WindowsRecycle.recycle(workspace);
         }
-        System.out.println("Native BASS probe verified: float and PCM16, seeks, source lifecycle and bypass.");
+        System.out.println("Native BASS verified: decode, float and PCM16 DSP, pause, seek recovery, loop, source change and detach.");
     }
 
-    private static void exercise(SymbolLookup bass, SymbolLookup mixer, BassLibrary library,
-                                 Path fixture, Arena arena, int format, int sourceFrameBytes) throws Throwable {
+    private static StemCache.Entry fixtureCache(Path fixture, Path work) throws Exception {
+        Path raw = work.resolve("six.f32");
+        int count = ProbeSignal.FRAME_COUNT;
+        var samples = ByteBuffer.allocate(count * StemCache.BYTES_PER_FRAME).order(ByteOrder.LITTLE_ENDIAN);
+        for (int frame = 0; frame < count; frame++) {
+            for (int lane = 0; lane < MixSettings.STEMS; lane++) {
+                for (int channel = 0; channel < 2; channel++) {
+                    samples.putFloat(ProbeSignal.stemSample(lane, frame, channel) / 32768f);
+                }
+            }
+        }
+        Files.write(raw, samples.array());
+        return new StemCache(work.resolve("cache"), WindowsRecycle::recycle)
+                .publish(StemCache.Identity.read(fixture), 44100, count, raw, work, Long.MAX_VALUE);
+    }
+
+    private static void exercise(SymbolLookup bass, SymbolLookup mixer, BassLibrary library, Path fixture,
+                                 StemCache.Entry cache, Arena arena, int format, int sourceFrameBytes) throws Throwable {
         var create = bind(bass, "BASS_StreamCreateFile", JAVA_INT, JAVA_INT, ADDRESS,
                 JAVA_LONG, JAVA_LONG, JAVA_INT);
         var createMixer = bind(mixer, "BASS_Mixer_StreamCreate", JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT);
         var add = bind(mixer, "BASS_Mixer_StreamAddChannel", JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT);
+        var sourceFlags = bind(mixer, "BASS_Mixer_ChannelFlags", JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT);
         var seek = bind(mixer, "BASS_Mixer_ChannelSetPosition", JAVA_INT, JAVA_INT, JAVA_LONG, JAVA_INT);
         var read = bind(bass, "BASS_ChannelGetData", JAVA_INT, JAVA_INT, ADDRESS, JAVA_INT);
         var free = bind(bass, "BASS_StreamFree", JAVA_INT, JAVA_INT);
@@ -59,50 +92,76 @@ final class BassChecks {
         int stream = (int) create.invokeExact(0, name, 0L, 0L, flags);
         int mix = (int) createMixer.invokeExact(44100, 2, DECODE | FLOAT);
         require(stream != 0 && mix != 0, "BASS could not open the test source and mixer");
-
-        var buffer = arena.allocate(PULL_FRAMES * 8, 8);
-        try (var effects = new BassSourceDsp(library)) {
-            require(!effects.attach(0), "invalid channel accepted");
-            require(effects.attach(stream), "could not attach to the decoded test WAV");
-            require(!effects.attach(stream), "duplicate DSP attached to one channel");
-            require((int) add.invokeExact(mix, stream, NO_RAMP) != 0, "could not add the source to BASSmix");
+        var buffer = arena.allocate(FRAMES * 8, 8);
+        var settings = new AtomicReference<>(MixSettings.DEFAULT);
+        var admitted = new AtomicReference<>(cache);
+        try (var effects = new BassSourceDsp(library, settings::get, admitted::get)) {
+            require(!effects.attach(0, fixture), "invalid channel accepted");
+            require(effects.attach(stream, fixture), "could not attach DSP");
+            require(!effects.attach(stream, fixture), "duplicate DSP");
+            effects.prefetch(fixture, cache);
+            require((int) add.invokeExact(mix, stream, NO_RAMP) != 0, "could not add source");
             pull(read, mix, buffer);
-            PcmChecks.checkOriginal(buffer, 0, PULL_FRAMES);
-            for (int start : new int[]{132407, 44831, 88001, 309116}) {
-                seek(seek, stream, start, sourceFrameBytes);
-                pull(read, mix, buffer);
-                // PCM16 rounds the crossfade back to native precision. Both fixtures share the exact
-                // source clock, and the float path checks the interpolated values at the transitions.
-                if (format == FLOAT || (start % 44100 >= 441 && start % 44100 + PULL_FRAMES < 44100)) {
-                    PcmChecks.checkOutput(buffer, start, PULL_FRAMES);
-                }
-            }
+            check(buffer, 0, 0, -1);
+            require((int) sourceFlags.invokeExact(stream, PAUSED, PAUSED) != -1, "could not pause source");
+            buffer.fill((byte) 0);
+            int paused = (int) read.invokeExact(mix, buffer, (int) buffer.byteSize());
+            require(paused == 0 || (paused == buffer.byteSize() && buffer.get(JAVA_FLOAT, 0) == 0),
+                    "paused mixer emitted source audio");
+            require((int) sourceFlags.invokeExact(stream, 0, PAUSED) != -1, "could not resume source");
 
+            settings.set(settings.get().withPreset(MixSettings.Preset.VOCALS));
+            pull(read, mix, buffer);
+            check(buffer, FRAMES, 500, 0);
+            int jump = 132407;
+            seek(seek, stream, jump, sourceFrameBytes);
+            pull(read, mix, buffer);
+            check(buffer, jump, 0, -1);
+            effects.prefetch(fixture, cache);
+            pull(read, mix, buffer);
+            check(buffer, jump + FRAMES, 500, 0);
+
+            admitted.set(null);
+            pull(read, mix, buffer);
+            check(buffer, jump + FRAMES * 2, 0, -1);
+            int beforeLoop = ProbeSignal.FRAME_COUNT - 110;
+            seek(seek, stream, beforeLoop, sourceFrameBytes);
+            pull(read, mix, buffer);
+            check(buffer, beforeLoop, 0, -1);
+
+            admitted.set(cache);
             effects.close();
-            int sample = 44213;
-            seek(seek, stream, sample, sourceFrameBytes);
+            seek(seek, stream, 1200, sourceFrameBytes);
             pull(read, mix, buffer);
-            PcmChecks.checkOriginal(buffer, sample, PULL_FRAMES);
-            require(!effects.attach(stream), "closed adapter accepted a source");
+            check(buffer, 1200, 0, -1);
         }
-
-        try (var effects = new BassSourceDsp(library)) {
-            require(effects.attach(stream), "replacement adapter could not attach");
+        try (var effects = new BassSourceDsp(library, settings::get, admitted::get)) {
+            require(effects.attach(stream, fixture), "replacement adapter could not attach");
             require((int) free.invokeExact(stream) != 0, "fixture stream could not be freed");
             int replacement = (int) create.invokeExact(0, name, 0L, 0L, flags);
-            require(replacement != 0 && effects.attach(replacement), "replacement source could not attach");
+            require(effects.attach(replacement, fixture), "replacement source did not attach");
+            effects.prefetch(fixture, cache);
             require((int) add.invokeExact(mix, replacement, NO_RAMP) != 0, "could not add replacement source");
-            int start = 177100;
-            seek(seek, replacement, start, sourceFrameBytes);
             pull(read, mix, buffer);
-            PcmChecks.checkOutput(buffer, start, PULL_FRAMES);
+            check(buffer, 0, 500, 0);
             require((int) free.invokeExact(replacement) != 0, "replacement stream could not be freed");
         }
         require((int) free.invokeExact(mix) != 0, "test mixer could not be freed");
     }
 
-    private static void seek(MethodHandle seek, int stream, int frame, int frameBytes) throws Throwable {
-        require((int) seek.invokeExact(stream, (long) frame * frameBytes, NO_RAMP) != 0, "source seek failed");
+    private static void check(MemorySegment block, int sourceFrame, int skip, int track) {
+        for (int frame = skip; frame < FRAMES; frame++) {
+            for (int channel = 0; channel < 2; channel++) {
+                short value = track < 0 ? ProbeSignal.originalSample(sourceFrame + frame, channel)
+                        : ProbeSignal.stemSample(track, sourceFrame + frame, channel);
+                near(block.getAtIndex(JAVA_FLOAT, frame * 2L + channel), value / 32768f,
+                        "BASS source frame " + (sourceFrame + frame));
+            }
+        }
+    }
+
+    private static void seek(MethodHandle seek, int stream, int frame, int bytes) throws Throwable {
+        require((int) seek.invokeExact(stream, (long) frame * bytes, NO_RAMP) != 0, "source seek failed");
     }
 
     private static void pull(MethodHandle read, int mixer, MemorySegment buffer) throws Throwable {
@@ -110,8 +169,7 @@ final class BassChecks {
                 "mixer returned an incomplete PCM block");
     }
 
-    private static MethodHandle bind(SymbolLookup library, String name, java.lang.foreign.MemoryLayout result,
-                                     java.lang.foreign.MemoryLayout... args) {
+    private static MethodHandle bind(SymbolLookup library, String name, MemoryLayout result, MemoryLayout... args) {
         return LINKER.downcallHandle(library.findOrThrow(name), FunctionDescriptor.of(result, args));
     }
 }

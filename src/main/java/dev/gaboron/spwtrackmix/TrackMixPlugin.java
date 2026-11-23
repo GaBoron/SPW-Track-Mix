@@ -8,93 +8,152 @@ import com.xuncorp.spw.workshop.api.hook.HookHandle;
 import com.xuncorp.spw.workshop.api.hook.MethodHook;
 import com.xuncorp.spw.workshop.api.hook.MethodHookParam;
 
+import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
 import java.util.List;
 
 public final class TrackMixPlugin extends SpwPlugin {
     private static final System.Logger LOG = System.getLogger(TrackMixPlugin.class.getName());
     private static final String BASS_BINDING = "com.moriafly.bass.BASS";
-    // Windows Steam SPW 1.19.3 stream factory used by the local PCM decoder.
+    // The local file factory in the Windows Steam 1.19.3 installation.
     private static final String CREATE_FILE_STREAM = "\u037f";
+    private static volatile TrackMixHostUi mixerWindow;
 
-    private HookHandle hook;
-    private BassSourceDsp effects;
-    private boolean stopped;
+    private HookHandle streamHook;
+    private TrackMixSession session;
+    private TrackMixHostUi window;
 
     public TrackMixPlugin(PluginContext context) {
         super(context);
     }
 
+    public static void openMixer() {
+        var active = mixerWindow;
+        if (active != null) {
+            active.open();
+        } else {
+            WorkshopApi.ui().toast("请在 Windows x64 Steam 版 SPW 1.19.3 中启用 Track Mix",
+                    WorkshopApi.Ui.ToastType.Warning);
+        }
+    }
+
     @Override
     public synchronized void start() {
         var context = getPluginContext();
+        if (session != null) {
+            return;
+        }
         if (!"1.19.3".equals(context.getSpwVersion())
                 || context.getSpwChannel() != Channel.Steam
                 || !System.getProperty("os.name", "").startsWith("Windows")
                 || !"amd64".equals(System.getProperty("os.arch"))) {
-            LOG.log(System.Logger.Level.INFO, "The PCM probe is limited to SPW Steam 1.19.3 on Windows x64");
+            LOG.log(System.Logger.Level.INFO, "Track Mix supports Steam SPW 1.19.3 on Windows x64");
             return;
         }
 
-        ProbeSignal.prepare();
-        stopped = false;
-        hook = WorkshopApi.hookRegistrar().hookMethod(BASS_BINDING, CREATE_FILE_STREAM,
-                List.of("java.lang.String", "long", "long", "int"), new MethodHook() {
-                    @Override
-                    public void after(MethodHookParam call) {
-                        if (!call.isOriginalSkipped() && call.getThrowable() == null
-                                && call.getResult() instanceof Integer channel && channel != 0
-                                && call.getArgs()[0] instanceof String path
-                                && isProbePath(path)) {
-                            attachProbe(channel);
+        String location = System.getenv("LOCALAPPDATA");
+        if (location == null) {
+            throw new IllegalStateException("找不到 Windows 本地应用数据目录");
+        }
+        var created = new TrackMixSession(Path.of(location, "SPW Track Mix").toAbsolutePath().normalize(),
+                TrackMixPlugin::currentTrack);
+        try {
+            streamHook = WorkshopApi.hookRegistrar().hookMethod(BASS_BINDING, CREATE_FILE_STREAM,
+                    List.of("java.lang.String", "long", "long", "int"), new MethodHook() {
+                        @Override
+                        public void after(MethodHookParam call) {
+                            if (!call.isOriginalSkipped() && call.getThrowable() == null
+                                    && call.getResult() instanceof Integer channel && channel != 0) {
+                                Object[] args = call.getArgs();
+                                if (args[0] instanceof String path && (long) args[1] == 0 && (long) args[2] == 0) {
+                                    created.sourceOpened(channel, path);
+                                }
+                            }
                         }
+                    });
+            window = new TrackMixHostUi(created);
+            window.install();
+            created.start();
+            session = created;
+            mixerWindow = window;
+        } catch (RuntimeException | Error error) {
+            try {
+                if (streamHook != null) {
+                    streamHook.unhook();
+                    streamHook = null;
+                }
+            } finally {
+                try {
+                    if (window != null) {
+                        window.close();
+                        window = null;
                     }
-                });
+                } finally {
+                    created.close();
+                }
+            }
+            throw error;
+        }
     }
 
-    private static boolean isProbePath(String path) {
-        int separator = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
-        return path.substring(separator + 1).equalsIgnoreCase(ProbeSignal.FILE_NAME);
-    }
-
-    private synchronized void attachProbe(int channel) {
-        if (stopped) {
-            return;
+    private static TrackMixSession.Track currentTrack() {
+        var track = WorkshopApi.playback().getCurrentMediaItem();
+        if (track == null || track.getPath().isBlank()) {
+            return null;
         }
         try {
-            if (effects == null) {
-                String resources = System.getProperty("compose.application.resources.dir");
-                var bass = BassLibrary.resolveLoaded(Path.of(resources).toAbsolutePath().resolve("bass.dll"));
-                effects = new BassSourceDsp(bass);
+            Path path = Path.of(track.getPath()).normalize();
+            if (path.isAbsolute() && path.getFileName() != null) {
+                String title = track.getTitle().isBlank() ? path.getFileName().toString() : track.getTitle();
+                return new TrackMixSession.Track(path, title);
             }
-            if (effects.attach(channel)) {
-                LOG.log(System.Logger.Level.INFO, "Attached the six-tone DSP to the SPW test track");
-            }
-        } catch (Throwable error) {
-            LOG.log(System.Logger.Level.WARNING, "The SPW test track will play through unmodified", error);
+        } catch (InvalidPathException ignored) {
+            // URI-backed and external playback do not have a native local file stream.
         }
+        return null;
     }
 
     @Override
     public void stop() {
-        HookHandle handle;
-        BassSourceDsp activeEffects;
+        HookHandle hook;
+        TrackMixSession active;
+        TrackMixHostUi oldWindow;
         synchronized (this) {
-            stopped = true;
-            handle = hook;
-            hook = null;
-            activeEffects = effects;
-            effects = null;
+            hook = streamHook;
+            streamHook = null;
+            active = session;
+            session = null;
+            oldWindow = window;
+            window = null;
+            if (mixerWindow == oldWindow) {
+                mixerWindow = null;
+            }
         }
 
         try {
-            if (activeEffects != null) {
-                activeEffects.close();
+            if (hook != null) {
+                hook.unhook();
             }
         } finally {
-            if (handle != null) {
-                handle.unhook();
+            try {
+                if (oldWindow != null) {
+                    oldWindow.close();
+                }
+            } finally {
+                if (active != null) {
+                    active.close();
+                }
             }
         }
+    }
+
+    @Override
+    public void update() {
+        stop();
+    }
+
+    @Override
+    public void delete() {
+        stop();
     }
 }
