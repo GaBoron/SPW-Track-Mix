@@ -3,6 +3,7 @@ package dev.gaboron.spwtrackmix;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ScheduledExecutorService;
@@ -22,7 +23,7 @@ final class TrackMixSession implements AutoCloseable {
 
     record Selection(Track track, StemCache.Identity identity, StemCache.Entry entry, String error) {}
     record Status(Selection selection, MixSettings mix, boolean attached, TrackMixJobs.Snapshot queue,
-                  String notice, long cacheBytes, boolean modelReady) {
+                  String notice, long cacheBytes, boolean modelReady, long modelBytes) {
         boolean canSeparate() {
             return !queue.currentQueued() && selection != null && selection.identity != null
                     && (selection.entry == null || selection.entry.quick());
@@ -32,6 +33,8 @@ final class TrackMixSession implements AutoCloseable {
             return canSeparate() && selection.entry == null;
         }
     }
+
+    record CacheCatalog(List<StemCache.CachedTrack> tracks, long bytes, String error) {}
 
     private record Playback(Selection selection, MixSettings mix) {
         private static final Playback EMPTY = new Playback(null, MixSettings.DEFAULT);
@@ -57,10 +60,13 @@ final class TrackMixSession implements AutoCloseable {
     private volatile TrackMixOptions options;
     private TrackMixOptions saved;
     private final Object playbackLock = new Object();
+    private final Object preloadLock = new Object();
     private volatile Playback playback = Playback.EMPTY;
     private volatile boolean closed;
     private volatile boolean modelReady;
-    private volatile long cacheBytes;
+    private volatile long modelBytes;
+    private volatile CacheCatalog catalog;
+    private volatile String removingDigest;
     private volatile String notice = "";
     private long seenCacheRevision = -1;
     private volatile BassSourceDsp effects;
@@ -116,8 +122,14 @@ final class TrackMixSession implements AutoCloseable {
         Selection selected = current.selection;
         var active = effects;
         var queue = jobs.snapshot(selected == null || selected.identity == null ? null : selected.identity.digest());
+        var storage = catalog;
         return new Status(selected, current.mix, selected != null && active != null
-                && active.attached(selected.track.path, selected.entry), queue, notice, cacheBytes, modelReady);
+                && active.attached(selected.track.path, selected.entry), queue, notice,
+                storage == null ? 0 : storage.bytes, modelReady, modelBytes);
+    }
+
+    CacheCatalog cacheCatalog() {
+        return catalog;
     }
 
     TrackMixOptions options() {
@@ -190,25 +202,31 @@ final class TrackMixSession implements AutoCloseable {
     }
 
     void clearCurrent() {
-        clearCurrent(null);
-    }
-
-    void clearCurrent(Track expected) {
         Selection selected = refreshSelection();
-        if (selected != null && selected.identity != null && (expected == null || selected.track.sameSource(expected))) {
-            jobs.maintain(selected.track.title, task -> {
-                bypassCurrent();
-                cache.clear(selected.identity);
-                return "当前歌曲缓存已移入回收站";
-            });
+        if (selected != null && selected.identity != null) {
+            clearCache(selected.identity.digest(), selected.track.title);
         }
     }
 
     void clearAll() {
-        jobs.maintain("音轨缓存", task -> {
-            bypassCurrent();
-            cache.evict(0, null);
-            return "音轨缓存已移入回收站";
+        clearCache("", "全部歌曲");
+    }
+
+    void clearCachedTrack(StemCache.CachedTrack track) {
+        clearCache(track.digest(), track.displayName());
+    }
+
+    private void clearCache(String digest, String title) {
+        jobs.maintain(title, task -> {
+            removingDigest = digest;
+            cacheRevision.incrementAndGet();
+            try {
+                bypassCurrent(digest);
+                cache.clear(digest);
+                return "音轨缓存已移入回收站";
+            } finally {
+                removingDigest = null;
+            }
         });
     }
 
@@ -232,6 +250,7 @@ final class TrackMixSession implements AutoCloseable {
             task.report("cache", 0);
             var entry = cache.publish(selected.identity, format.rate(), format.frames(), output, input, staging,
                     options.cacheBytes(), quick);
+            refreshCatalog(selected.identity.digest(), selected.track.title);
             var current = playback.selection;
             if (current != null && current.identity != null
                     && current.identity.digest().equals(selected.identity.digest())) {
@@ -308,6 +327,7 @@ final class TrackMixSession implements AutoCloseable {
             } else if (revision == seenCacheRevision) {
                 return;
             }
+            if (removes(identity, removingDigest)) return;
             Selection result;
             try {
                 result = new Selection(track, identity, cache.lookup(identity), "");
@@ -316,6 +336,7 @@ final class TrackMixSession implements AutoCloseable {
             }
             if (revision == cacheRevision.get() && publishSelection(selected, result)) {
                 seenCacheRevision = revision;
+                rememberLegacyTitle(identity.digest(), track.title);
             }
         } catch (Exception error) {
             if (selected != null) {
@@ -338,16 +359,16 @@ final class TrackMixSession implements AutoCloseable {
 
 
     private void prefetch() {
-        var active = effects;
-        var current = playback.selection;
-        if (active == null) {
-            return;
-        }
-        try {
-            active.prefetch(current == null ? null : current.track.path, current == null ? null : current.entry);
-        } catch (IOException error) {
-            if (current != null) {
-                publishSelection(current, new Selection(current.track, current.identity, null, display(error)));
+        synchronized (preloadLock) {
+            var active = effects;
+            var current = playback.selection;
+            if (active == null) return;
+            try {
+                active.prefetch(current == null ? null : current.track.path, current == null ? null : current.entry);
+            } catch (IOException error) {
+                if (current != null) {
+                    publishSelection(current, new Selection(current.track, current.identity, null, display(error)));
+                }
             }
         }
     }
@@ -356,7 +377,7 @@ final class TrackMixSession implements AutoCloseable {
         try {
             // Drop published windows before any eviction.
             if (cache.size() > options.cacheBytes()) {
-                bypassCurrent();
+                bypassCurrent("");
                 cache.evict(options.cacheBytes(), null);
             }
         } catch (IOException error) {
@@ -366,29 +387,60 @@ final class TrackMixSession implements AutoCloseable {
         }
     }
 
-    private void bypassCurrent() {
-        var selected = playback.selection;
-        if (selected != null) {
-            publishSelection(selected, new Selection(selected.track, selected.identity, null, ""));
-        }
-        var active = effects;
-        if (active != null) {
-            try {
-                active.prefetch(null, null);
-            } catch (IOException impossible) {
-                throw new AssertionError(impossible);
+    private void bypassCurrent(String digest) {
+        synchronized (preloadLock) {
+            synchronized (playbackLock) {
+                var selected = playback.selection;
+                if (selected == null || !removes(selected.identity, digest)) return;
+                playback = new Playback(new Selection(selected.track, selected.identity, null, ""), playback.mix);
+            }
+            var active = effects;
+            if (active != null) {
+                try {
+                    active.prefetch(null, null);
+                } catch (IOException impossible) {
+                    throw new AssertionError(impossible);
+                }
             }
         }
     }
 
+    private static boolean removes(StemCache.Identity identity, String digest) {
+        return digest != null && (digest.isEmpty() || (identity != null && digest.equals(identity.digest())));
+    }
+
     private void refreshStorage() {
         modelReady = engine.hasModel();
-        try {
-            cacheBytes = cache.size();
-        } catch (IOException error) {
-            notice = display(error);
-        }
+        modelBytes = engine.modelBytes();
+        refreshCatalog(null, "");
         cacheRevision.incrementAndGet();
+    }
+
+    private void refreshCatalog(String digest, String title) {
+        try {
+            var tracks = cache.catalog(digest, title);
+            catalog = new CacheCatalog(tracks, tracks.stream().mapToLong(StemCache.CachedTrack::bytes).sum(), "");
+        } catch (IOException error) {
+            var previous = catalog;
+            catalog = new CacheCatalog(previous == null ? List.of() : previous.tracks,
+                    previous == null ? 0 : previous.bytes, "无法读取缓存列表");
+            LOG.log(System.Logger.Level.WARNING, "Could not read Track Mix cache catalog", error);
+        }
+    }
+
+    private void rememberLegacyTitle(String digest, String title) {
+        if (title.isBlank() || !needsTitle(catalog, digest)) return;
+        worker.execute(() -> {
+            if (needsTitle(catalog, digest)) refreshCatalog(digest, title);
+        });
+    }
+
+    private static boolean needsTitle(CacheCatalog catalog, String digest) {
+        if (catalog == null) return false;
+        for (var track : catalog.tracks) {
+            if (track.digest().equals(digest)) return track.title().isBlank();
+        }
+        return false;
     }
 
     private void saveSettings() {

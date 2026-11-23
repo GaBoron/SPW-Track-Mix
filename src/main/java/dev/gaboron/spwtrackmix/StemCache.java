@@ -16,8 +16,11 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HexFormat;
 import java.util.List;
+import java.util.Properties;
+import java.util.regex.Pattern;
 import java.util.zip.CRC32C;
 
 final class StemCache {
@@ -30,6 +33,8 @@ final class StemCache {
     static final int HEADER_BYTES = BASE_HEADER_BYTES + LoudnessProfile.BYTES;
     private static final int CHUNK_BYTES = BYTES_PER_FRAME * 16384;
     private static final String MODEL = "a443a298-";
+    private static final Pattern CACHE_NAME = Pattern.compile("[a-f0-9]{8}-(quick-)?([a-f0-9]{64})\\.stems");
+    private static final System.Logger LOG = System.getLogger(StemCache.class.getName());
     private final Path root;
     private final Recycler recycler;
 
@@ -99,7 +104,13 @@ final class StemCache {
         }
     }
 
-    Entry lookup(Identity id) throws IOException {
+    record CachedTrack(String digest, String title, long bytes, FileTime lastUsed, boolean quick, boolean standard) {
+        String displayName() {
+            return title.isBlank() ? "旧缓存 " + digest.substring(0, 12) : title;
+        }
+    }
+
+    synchronized Entry lookup(Identity id) throws IOException {
         Path path = entryPath(id, false);
         if (!Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)) {
             path = entryPath(id, true);
@@ -185,18 +196,72 @@ final class StemCache {
         return total;
     }
 
-    void clear(Identity id) throws IOException {
-        clearEntry(entryPath(id, false));
-        clearEntry(entryPath(id, true));
+    List<CachedTrack> catalog(String namedDigest, String title) throws IOException {
+        var groups = new HashMap<String, CachedTrack>();
+        for (Path file : entries()) {
+            var name = CACHE_NAME.matcher(file.getFileName().toString());
+            if (!name.matches()) continue;
+            var info = Files.readAttributes(file, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+            String digest = name.group(2);
+            boolean quick = name.group(1) != null;
+            groups.merge(digest, new CachedTrack(digest, "", info.size(), info.lastModifiedTime(), quick, !quick),
+                    (first, second) -> new CachedTrack(digest, "", first.bytes + second.bytes,
+                            first.lastUsed.compareTo(second.lastUsed) >= 0 ? first.lastUsed : second.lastUsed,
+                            first.quick || second.quick, first.standard || second.standard));
+        }
+        var titles = readTitles();
+        var updated = new Properties();
+        updated.putAll(titles);
+        updated.keySet().retainAll(groups.keySet());
+        if (namedDigest != null && groups.containsKey(namedDigest) && !title.isBlank()) {
+            updated.setProperty(namedDigest, title);
+        }
+        if (!titles.equals(updated)) writeTitles(updated);
+        return groups.values().stream()
+                .sorted(Comparator.comparing(CachedTrack::lastUsed).reversed().thenComparing(CachedTrack::digest))
+                .map(track -> new CachedTrack(track.digest, updated.getProperty(track.digest, ""), track.bytes,
+                        track.lastUsed, track.quick, track.standard))
+                .toList();
     }
 
-    private void clearEntry(Path path) throws IOException {
-        if (Files.exists(path, LinkOption.NOFOLLOW_LINKS)) {
-            recycle(path);
+    private Properties readTitles() {
+        var titles = new Properties();
+        Path index = root.resolve("titles.properties");
+        if (Files.isRegularFile(index, LinkOption.NOFOLLOW_LINKS)) {
+            try (var input = Files.newInputStream(index)) {
+                titles.load(input);
+            } catch (IOException | IllegalArgumentException error) {
+                LOG.log(System.Logger.Level.WARNING, "Could not read cache titles", error);
+            }
+        }
+        return titles;
+    }
+
+    private void writeTitles(Properties titles) {
+        Path pending = root.resolve("titles.pending");
+        try {
+            try (var output = Files.newOutputStream(pending, StandardOpenOption.CREATE,
+                    StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE, LinkOption.NOFOLLOW_LINKS)) {
+                titles.store(output, null);
+            }
+            Files.move(pending, root.resolve("titles.properties"),
+                    StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+        } catch (IOException error) {
+            LOG.log(System.Logger.Level.WARNING, "Could not save cache titles", error);
         }
     }
 
-    void evict(long limit, Path keep) throws IOException {
+    synchronized void clear(String digest) throws IOException {
+        if (!digest.isEmpty() && !digest.matches("[a-f0-9]{64}")) {
+            throw new IllegalArgumentException("Invalid source identity");
+        }
+        String suffix = digest + ".stems";
+        for (Path file : entries()) {
+            if (file.getFileName().toString().endsWith(suffix)) recycle(file);
+        }
+    }
+
+    synchronized void evict(long limit, Path keep) throws IOException {
         List<Path> files = entries().stream()
                 .filter(path -> !path.equals(keep))
                 .sorted(Comparator.comparing(StemCache::lastUsed))
@@ -298,10 +363,13 @@ final class StemCache {
             return List.of();
         }
         try (var paths = Files.list(root)) {
-            return paths.filter(p -> p.getFileName().toString().matches("[a-f0-9]{8}-(?:quick-)?[a-f0-9]{64}\\.stems"))
-                    .filter(p -> Files.isRegularFile(p, LinkOption.NOFOLLOW_LINKS))
-                    .toList();
+            return paths.filter(StemCache::isCacheFile).toList();
         }
+    }
+
+    private static boolean isCacheFile(Path path) {
+        return CACHE_NAME.matcher(path.getFileName().toString()).matches()
+                && Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS);
     }
 
     private Path entryPath(Identity id, boolean quick) {

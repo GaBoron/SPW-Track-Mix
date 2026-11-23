@@ -186,8 +186,17 @@ final class PcmChecks {
             var entry = cache.publish(identity, 48000, FRAMES, raw, null, directory, Long.MAX_VALUE, false);
             require(!cache.lookup(identity).quick() && cache.lookup(identity).path().equals(entry.path())
                     && Files.isRegularFile(rough.path()), "standard output must take priority over the rough result");
-            cache.clear(identity);
+            var unnamed = cache.catalog(null, "").getFirst();
+            require(unnamed.title().isEmpty() && unnamed.displayName().startsWith("旧缓存"),
+                    "a cache created before the title index must still be manageable");
+            var named = cache.catalog(identity.digest(), "测试歌曲").getFirst();
+            require(named.bytes() == Files.size(rough.path()) + Files.size(entry.path())
+                    && named.quick() && named.standard(), "the catalog did not combine both profiles and their sizes");
+            require(new StemCache(cacheDir, WindowsRecycle::recycle).catalog(null, "").getFirst().displayName()
+                    .equals("测试歌曲"), "the song name did not survive reopening the cache");
+            cache.clear(identity.digest());
             require(cache.lookup(identity) == null && !Files.exists(rough.path()), "clearing a track must clear both versions");
+            require(cache.catalog(null, "").isEmpty(), "the catalog did not reflect deletion");
             entry = cache.publish(identity, 48000, FRAMES, raw, null, directory, Long.MAX_VALUE, false);
             require(cache.lookup(identity).crc() == entry.crc(), "cached data not reused");
             var window = StemCache.readWindow(entry, 102, 100);
@@ -235,6 +244,12 @@ final class PcmChecks {
             var first = new TrackMixSession.Track(firstPath, "First", "a");
             var second = new TrackMixSession.Track(secondPath, "Second", "b");
             var selected = new AtomicReference<>(first);
+            var cachedDigest = StemCache.Identity.read(secondPath).digest();
+            Path cacheDir = Files.createDirectory(directory.resolve("cache"));
+            Path cached = Files.write(cacheDir.resolve("9abcdef0-" + cachedDigest + ".stems"), new byte[1536]);
+            Path orphan = Files.createFile(cacheDir.resolve("9abcdef0-quick-" + "a".repeat(64) + ".stems"));
+            Path assets = Files.createDirectory(directory.resolve("models"));
+            Path model = Files.write(assets.resolve("BS-Rofo-SW-Fixed.ckpt.part"), new byte[32]);
             var mix = MixSettings.DEFAULT.withVolume(3, 65).withMuted(1).withSolo(3);
             var preferences = new TrackMixOptions(24, true, true, true);
             try (var session = new TrackMixSession(directory, selected::get)) {
@@ -261,7 +276,7 @@ final class PcmChecks {
 
                 session.setMix(ignored -> mix);
                 try (var link = new TrackMixLink(session)) {
-                    checkAmllPanel(anotherItem, preferences, session);
+                    checkAmllPanel(anotherItem, preferences, session, cachedDigest, cached, orphan, model);
                 }
             }
 
@@ -300,8 +315,8 @@ final class PcmChecks {
         }
     }
 
-    private static void checkAmllPanel(TrackMixSession.Track track, TrackMixOptions preferences, TrackMixSession session)
-            throws Exception {
+    private static void checkAmllPanel(TrackMixSession.Track track, TrackMixOptions preferences, TrackMixSession session,
+                                       String cachedDigest, Path cached, Path orphan, Path model) throws Exception {
         var server = ManagementFactory.getPlatformMBeanServer();
         var name = new ObjectName("io.github.gaboron.amllspw:type=PlayerPanel,version=1,provider=dev.gaboron.spwtrackmix");
         var spectrum = new ObjectName("io.github.gaboron.amllspw:type=SpectrumSource,version=1,provider=dev.gaboron.spwtrackmix");
@@ -314,12 +329,48 @@ final class PcmChecks {
         var main = (List<?>) server.invoke(name, "render", new Object[]{"fixture", context}, render);
         require(main.stream().anyMatch(row -> "quick".equals(((Map<?, ?>) row).get("action"))),
                 "generic panel did not offer quick separation for the selected track");
+        var gear = findControl(main, "action", "settings");
+        require(gear != null && "chip".equals(gear.get("style")) && ((String) gear.get("svg")).contains("<circle"),
+                "mixer header did not expose the settings icon");
         var stale = (List<?>) server.invoke(name, "render", new Object[]{"fixture",
                 Map.of("trackId", "previous", "path", track.path().toString())}, render);
         require(stale.stream().noneMatch(row -> "quick".equals(((Map<?, ?>) row).get("action"))),
                 "a stale host selection exposed actions for a different track");
 
         server.invoke(name, "action", new Object[]{"fixture", context, "settings", 0}, edit);
+        var settings = (List<?>) server.invoke(name, "render", new Object[]{"fixture", context}, render);
+        require(findControl(settings, "text", "未就绪 · 32 B") != null
+                && findControl(settings, "action", "deleteAll") == null,
+                "settings should show the model's disk usage and a single entry to manage the cache");
+        server.invoke(name, "action", new Object[]{"fixture", context, "manageCache", 0}, edit);
+        var cache = (List<?>) server.invoke(name, "render", new Object[]{"fixture", context}, render);
+        require(findControl(cache, "text", "2 首 · 已占用 1.5 KiB") != null
+                && findControl(cache, "text", "标准分离 · 1.5 KiB") != null
+                && findControl(cache, "action", "delete." + cachedDigest) != null,
+                "cache manager did not show the non-playing song and its size");
+        require(findControl(cache, "text", "Second") != null, "playing a song did not label the matching legacy cache");
+        server.invoke(name, "action", new Object[]{"fixture", context, "delete." + cachedDigest, 0}, edit);
+        var pending = (List<?>) server.invoke(name, "render", new Object[]{"fixture", context}, render);
+        require(Files.isRegularFile(cached) && findControl(pending, "action", "confirmCache") != null,
+                "the cache entry must remain on disk until confirmed");
+        server.invoke(name, "action", new Object[]{"fixture", context, "cancelCache", 0}, edit);
+        server.invoke(name, "action", new Object[]{"fixture", context, "confirmCache", 0}, edit);
+        require(Files.isRegularFile(cached), "cancelled deletion must not remove the cache");
+        server.invoke(name, "action", new Object[]{"fixture", context, "delete." + cachedDigest, 0}, edit);
+        server.invoke(name, "action", new Object[]{"fixture", context, "confirmCache", 0}, edit);
+        awaitStorage(session, 1);
+        var remaining = (List<?>) server.invoke(name, "render", new Object[]{"fixture", context}, render);
+        require(!Files.exists(cached) && Files.isRegularFile(orphan)
+                && findControl(remaining, "text", "1 首 · 已占用 0 B") != null,
+                "deleting a song removed or counted the wrong cache files");
+        server.invoke(name, "action", new Object[]{"fixture", context, "deleteAll", 0}, edit);
+        server.invoke(name, "action", new Object[]{"fixture", context, "confirmCache", 0}, edit);
+        awaitStorage(session, 0);
+        var empty = (List<?>) server.invoke(name, "render", new Object[]{"fixture", context}, render);
+        require(findControl(empty, "text", "暂无缓存，已占用 0 B") != null && !Files.exists(orphan)
+                && Files.isRegularFile(track.path()) && Files.isRegularFile(model),
+                "deletion must update the total, preserve the source, and preserve the model");
+        server.invoke(name, "action", new Object[]{"fixture", context, "backFromCache", 0}, edit);
         server.invoke(name, "action", new Object[]{"fixture", context, "cacheGiB", preferences.cacheGiB()}, edit);
         server.invoke(name, "action", new Object[]{"fixture", context, "cpu", 0}, edit);
         server.invoke(name, "action", new Object[]{"fixture", context, "fp16", 0}, edit);
@@ -330,6 +381,27 @@ final class PcmChecks {
         server.invoke(name, "close", new Object[]{"fixture"}, new String[]{"java.lang.String"});
         require(server.invoke(spectrum, "spectrum", new Object[]{track.path().toString(), 0L},
                 new String[]{"java.lang.String", "long"}) == null, "inactive spectrum must fall back to original PCM");
+    }
+
+    private static void awaitStorage(TrackMixSession session, int tracks) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        do {
+            if (session.cacheCatalog().tracks().size() == tracks && session.status().queue().items().isEmpty()) return;
+            Thread.sleep(10);
+        } while (System.nanoTime() < deadline);
+        throw new AssertionError("cache maintenance did not finish with " + tracks + " cached tracks");
+    }
+
+    private static Map<?, ?> findControl(List<?> controls, String property, String expected) {
+        for (Object item : controls) {
+            var control = (Map<?, ?>) item;
+            if (expected.equals(control.get(property))) return control;
+            if (control.get("children") instanceof List<?> children) {
+                var match = findControl(children, property, expected);
+                if (match != null) return match;
+            }
+        }
+        return null;
     }
 
     private static void queueChecks() {

@@ -5,8 +5,10 @@ import java.io.IOException;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
@@ -15,6 +17,8 @@ import java.util.function.BiConsumer;
 
 final class PythonEngine {
     private static final String VERSION = "0.48.0";
+    private static final List<String> MODEL_FILES = List.of("BS-Rofo-SW-Fixed.ckpt", "BS-Rofo-SW-Fixed.yaml",
+            "BS-Rofo-SW-Fixed.ckpt.part", "BS-Rofo-SW-Fixed.yaml.part");
     private final Path root;
     private final Path models;
     private final Path runtime;
@@ -36,16 +40,28 @@ final class PythonEngine {
         }
     }
 
+    long modelBytes() {
+        long bytes = 0;
+        for (String name : MODEL_FILES) {
+            try {
+                var file = Files.readAttributes(models.resolve(name), BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+                if (file.isRegularFile()) bytes += file.size();
+            } catch (IOException missing) {
+                // The checkpoint and partial files may be absent.
+            }
+        }
+        return bytes;
+    }
+
     void prepareModel(Task task) throws IOException, InterruptedException {
         Path script = workerScript();
         run(task, List.of("py", "-3.13", "-u", script.toString(), "--models", models.toString()));
     }
 
     void removeModel() throws IOException {
-        for (String name : List.of("BS-Rofo-SW-Fixed.ckpt", "BS-Rofo-SW-Fixed.yaml",
-                "BS-Rofo-SW-Fixed.ckpt.part", "BS-Rofo-SW-Fixed.yaml.part")) {
+        for (String name : MODEL_FILES) {
             Path path = models.resolve(name);
-            if (Files.isRegularFile(path, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+            if (Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)) {
                 WindowsRecycle.recycle(path);
             }
         }
