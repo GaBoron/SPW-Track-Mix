@@ -10,7 +10,13 @@ import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
 import java.util.Properties;
+import javax.management.ObjectName;
+import java.lang.management.ManagementFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -30,7 +36,7 @@ final class PcmChecks {
                 }
             }
             var entry = new StemCache.Entry(Path.of("fixture"), 44100, FRAMES, 0,
-                    new float[]{0.05f, 0.10f, 0.15f, 0.20f, 0.25f, 0.30f}, 0, null);
+                    new float[]{0.05f, 0.10f, 0.15f, 0.20f, 0.25f, 0.30f}, 0, null, false);
             var window = new StemCache.Window(entry, 0, samples);
             var buffer = arena.allocate(500 * AudioFormat.FLOAT_FRAME_BYTES);
             var mixer = new RealtimeStemMixer(44100);
@@ -70,7 +76,8 @@ final class PcmChecks {
         spectrumChecks();
         cacheChecks();
         playbackSessionChecks();
-        System.out.println("Mixer, loudness, cached PCM, source-positioned FFT and per-track resets verified.");
+        queueChecks();
+        System.out.println("Mixer, loudness, cached PCM, source-positioned FFT per-track resets, and queued separation verified.");
     }
 
     private static void mixerControlChecks() {
@@ -171,9 +178,17 @@ final class PcmChecks {
             Files.write(raw, data.array());
             Path cacheDir = directory.resolve("cache");
             Path retired = Files.createDirectory(directory.resolve("retired"));
-            var cache = new StemCache(cacheDir, path -> Files.move(path, retired.resolve(path.getFileName())));
+            var cache = new StemCache(cacheDir, path ->
+                    Files.move(path, Files.createTempDirectory(retired, "entry-").resolve(path.getFileName())));
             var identity = StemCache.Identity.read(source);
-            var entry = cache.publish(identity, 48000, FRAMES, raw, null, directory, Long.MAX_VALUE);
+            var rough = cache.publish(identity, 48000, FRAMES, raw, null, directory, Long.MAX_VALUE, true);
+            require(rough.quick() && cache.lookup(identity).quick(), "rough extraction was not reusable");
+            var entry = cache.publish(identity, 48000, FRAMES, raw, null, directory, Long.MAX_VALUE, false);
+            require(!cache.lookup(identity).quick() && cache.lookup(identity).path().equals(entry.path())
+                    && Files.isRegularFile(rough.path()), "standard output must take priority over the rough result");
+            cache.clear(identity);
+            require(cache.lookup(identity) == null && !Files.exists(rough.path()), "clearing a track must clear both versions");
+            entry = cache.publish(identity, 48000, FRAMES, raw, null, directory, Long.MAX_VALUE, false);
             require(cache.lookup(identity).crc() == entry.crc(), "cached data not reused");
             var window = StemCache.readWindow(entry, 102, 100);
             require(window.covers(102, 100) && !window.covers(101, 100), "window seek bounds");
@@ -190,7 +205,7 @@ final class PcmChecks {
             near(StemCache.readWindow(oldCache, 102, 100).samples()[1199], .125f, "legacy PCM offset");
             Files.write(entry.path(), bytes);
             long size = cache.size();
-            var second = cache.publish(StemCache.Identity.read(other), 48000, FRAMES, raw, null, directory, size);
+            var second = cache.publish(StemCache.Identity.read(other), 48000, FRAMES, raw, null, directory, size, false);
             require(cache.size() == size && cache.lookup(identity) == null, "old cache not evicted");
             try (var file = FileChannel.open(second.path(), StandardOpenOption.WRITE)) {
                 file.position(file.size() - 1);
@@ -245,7 +260,19 @@ final class PcmChecks {
                 requireDefault(awaitTrack(session, anotherItem).mix(), "switch between IDs that share a file");
 
                 session.setMix(ignored -> mix);
-                session.setOptions(preferences.cacheGiB(), preferences.quality(), preferences.cpu(), preferences.fp16());
+                try (var link = new TrackMixLink(session)) {
+                    var server = ManagementFactory.getPlatformMBeanServer();
+                    var name = new ObjectName("dev.gaboron.spwtrackmix:type=Mixer,version=1");
+                    server.invoke(name, "configure",
+                            new Object[]{preferences.cacheGiB(), preferences.quality(), preferences.cpu(), preferences.fp16()},
+                            new String[]{"int", "boolean", "boolean", "boolean"});
+                    var state = (Map<?, ?>) server.getAttribute(name, "State");
+                    var settings = (Map<?, ?>) state.get("settings");
+                    require(settings.get("cacheGiB").equals(24) && settings.get("fp16").equals(true),
+                            "AMLL settings did not read back");
+                    require(state.get("canQuick").equals(true) && ((List<?>) state.get("jobs")).isEmpty(),
+                            "AMLL separation actions or queue state missing");
+                }
             }
 
             var saved = new Properties();
@@ -280,6 +307,53 @@ final class PcmChecks {
         require(mix.preset == MixSettings.Preset.ORIGINAL && mix.muteMask() == 0 && mix.soloMask() == 0, context);
         for (int lane = 0; lane < MixSettings.STEMS; lane++) {
             require(mix.effectiveVolume(lane) == 100, context + ": a fader retained its previous value");
+        }
+    }
+
+    private static void queueChecks() {
+        var work = new ArrayDeque<Runnable>();
+        var ran = new ArrayList<String>();
+        try (var jobs = new TrackMixJobs(work::addLast, () -> {})) {
+            jobs.separate("First song", "a", false, task -> {
+                ran.add("a");
+                task.report("gpu32", .48);
+                var view = jobs.snapshot("b");
+                require(view.currentQueued() && view.items().size() == 2, "new song is not queued");
+                var active = view.items().getFirst();
+                require(active.title().equals("First song") && active.running()
+                        && active.progress().fraction() == .48, "switching tracks changed the active job label or progress");
+                return "finished";
+            });
+            jobs.separate("Second song", "b", true, task -> {
+                ran.add("b");
+                return "finished";
+            });
+            jobs.separate("Duplicate of second song", "b", false, task -> {
+                throw new AssertionError("duplicate job ran");
+            });
+            jobs.separate("Third song", "c", false, task -> {
+                throw new AssertionError("cancelled queued job ran");
+            });
+            var initial = jobs.snapshot("c");
+            require(initial.items().size() == 3 && !initial.items().get(1).running()
+                    && initial.items().get(1).kind() == TrackMixJobs.Kind.QUICK, "queue order or kind lost");
+            jobs.cancel(initial.items().getLast().id());
+            require(!jobs.snapshot("c").currentQueued(), "queued cancellation was ignored");
+
+            work.removeFirst().run();
+            var next = jobs.snapshot("b");
+            require(next.items().size() == 1 && next.items().getFirst().title().equals("Second song")
+                    && next.items().getFirst().running(), "next song was not promoted");
+            require(next.notice().startsWith("First song"), "completion notice used a different song title");
+            work.removeFirst().run();
+            require(ran.equals(List.of("a", "b")) && jobs.snapshot("b").items().isEmpty(), "queue did not drain");
+
+            jobs.separate("Never started", "a", true, task -> {
+                throw new AssertionError("cancelled active job ran");
+            });
+            jobs.cancel(jobs.snapshot("a").items().getFirst().id());
+            work.removeFirst().run();
+            require(jobs.snapshot("a").notice().contains("已取消"), "active cancellation did not finish");
         }
     }
 

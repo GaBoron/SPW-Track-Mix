@@ -16,6 +16,7 @@ public final class TrackMixLink implements AutoCloseable {
     public interface Mixer {
         Map<String, Object> getState();
         void command(String action, int lane, int value);
+        void configure(int cacheGiB, boolean quality, boolean cpu, boolean fp16);
         Object[] spectrum(String path, long positionMs);
     }
 
@@ -60,7 +61,17 @@ public final class TrackMixLink implements AutoCloseable {
             var state = session.status();
             var selection = state.selection();
             var mix = state.mix();
-            var job = state.job();
+            var options = session.options();
+            var jobs = state.queue().items();
+            var first = jobs.isEmpty() ? null : jobs.getFirst();
+            var tasks = jobs.stream().map(job -> Map.<String, Object>of(
+                    "id", job.id(),
+                    "title", job.title(),
+                    "kind", job.kind().name(),
+                    "running", job.running(),
+                    "cancelling", job.cancelling(),
+                    "stage", job.progress().stage(),
+                    "progress", job.progress().fraction())).toList();
             boolean cached = selection != null && selection.entry() != null;
             var levels = new int[MixSettings.STEMS];
             for (int lane = 0; lane < levels.length; lane++) {
@@ -68,25 +79,40 @@ public final class TrackMixLink implements AutoCloseable {
             }
             return Map.ofEntries(
                     Map.entry("title", selection == null ? "" : selection.track().title()),
+                    Map.entry("trackId", selection == null ? "" : selection.track().id()),
+                    Map.entry("trackPath", selection == null ? "" : selection.track().path().toString()),
                     Map.entry("cached", cached),
                     Map.entry("ready", cached && state.attached()),
-                    Map.entry("canSeparate", job == null && !cached && selection != null && selection.identity() != null),
+                    Map.entry("canSeparate", state.canSeparate()),
+                    Map.entry("canQuick", state.canQuickSeparate()),
+                    Map.entry("currentQueued", state.queue().currentQueued()),
+                    Map.entry("quickCached", cached && selection.entry().quick()),
                     Map.entry("levels", levels),
                     Map.entry("muted", mix.muteMask()),
                     Map.entry("solos", mix.soloMask()),
                     Map.entry("preset", mix.preset.ordinal()),
                     Map.entry("original", mix.original()),
-                    Map.entry("busy", job != null),
-                    Map.entry("stage", job == null ? "" : job.stage),
-                    Map.entry("progress", job == null ? 0d : job.progress),
+                    Map.entry("busy", first != null),
+                    Map.entry("stage", first == null ? "" : first.progress().stage()),
+                    Map.entry("progress", first == null ? 0d : first.progress().fraction()),
+                    Map.entry("jobs", tasks),
+                    Map.entry("jobNotice", state.queue().notice()),
+                    Map.entry("settings", Map.of("cacheGiB", options.cacheGiB(), "quality", options.quality(),
+                            "cpu", options.cpu(), "fp16", options.fp16(), "modelReady", state.modelReady(),
+                            "cacheBytes", state.cacheBytes(), "hasTrack", selection != null && selection.identity() != null)),
                     Map.entry("notice", selection != null && !selection.error().isBlank() ? selection.error() : state.notice()));
         }
 
         @Override
         public void command(String action, int lane, int value) {
             switch (action) {
-                case "separate" -> session.separate();
-                case "cancel" -> session.cancel();
+                case "separate" -> session.separate(false);
+                case "quick" -> session.separate(true);
+                case "prepareModel" -> session.prepareModel();
+                case "removeModel" -> session.removeModel();
+                case "clearCurrent" -> session.clearCurrent();
+                case "clearAll" -> session.clearAll();
+                case "cancel" -> session.cancel(value);
                 case "reset" -> session.setMix(ignored -> MixSettings.DEFAULT);
                 case "preset" -> {
                     var presets = MixSettings.Preset.values();
@@ -105,6 +131,13 @@ public final class TrackMixLink implements AutoCloseable {
                     }
                 }
                 default -> {}
+            }
+        }
+
+        @Override
+        public void configure(int cacheGiB, boolean quality, boolean cpu, boolean fp16) {
+            if (cacheGiB >= 1 && cacheGiB <= 100) {
+                session.setOptions(cacheGiB, quality, cpu, fp16);
             }
         }
 

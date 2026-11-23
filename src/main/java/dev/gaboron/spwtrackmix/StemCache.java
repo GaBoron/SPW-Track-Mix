@@ -73,7 +73,8 @@ final class StemCache {
         }
     }
 
-    record Entry(Path path, int rate, int frames, long crc, float[] peaks, int headerBytes, LoudnessProfile loudness) {
+    record Entry(Path path, int rate, int frames, long crc, float[] peaks, int headerBytes,
+                 LoudnessProfile loudness, boolean quick) {
         Entry {
             peaks = peaks.clone();
         }
@@ -99,16 +100,19 @@ final class StemCache {
     }
 
     Entry lookup(Identity id) throws IOException {
-        Path path = entryPath(id);
+        Path path = entryPath(id, false);
         if (!Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)) {
-            return null;
+            path = entryPath(id, true);
+            if (!Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)) {
+                return null;
+            }
         }
         Entry entry = verify(path);
         Files.setLastModifiedTime(path, FileTime.from(Instant.now()));
         return entry;
     }
 
-    Entry publish(Identity id, int rate, int frames, Path raw, Path original, Path staging, long limit)
+    Entry publish(Identity id, int rate, int frames, Path raw, Path original, Path staging, long limit, boolean quick)
             throws IOException {
         long dataBytes = (long) frames * BYTES_PER_FRAME;
         if (dataBytes + HEADER_BYTES > limit) {
@@ -119,7 +123,7 @@ final class StemCache {
             throw new IOException("分离输出不完整或音频文件已变更");
         }
         Files.createDirectories(root);
-        Path target = entryPath(id);
+        Path target = entryPath(id, quick);
         Path pending = staging.resolve("completed.stems");
         try (var input = FileChannel.open(raw, StandardOpenOption.READ);
              var reference = original == null ? null : FileChannel.open(original, StandardOpenOption.READ);
@@ -182,7 +186,11 @@ final class StemCache {
     }
 
     void clear(Identity id) throws IOException {
-        Path path = entryPath(id);
+        clearEntry(entryPath(id, false));
+        clearEntry(entryPath(id, true));
+    }
+
+    private void clearEntry(Path path) throws IOException {
         if (Files.exists(path, LinkOption.NOFOLLOW_LINKS)) {
             recycle(path);
         }
@@ -245,7 +253,7 @@ final class StemCache {
                 throw new IOException("音轨缓存完整性检查失败");
             }
             return new Entry(path, rate, frames, checksum, peaks, headerBytes,
-                    profile == null ? analysis.result() : profile);
+                    profile == null ? analysis.result() : profile, path.getFileName().toString().startsWith(MODEL + "quick-"));
         }
     }
 
@@ -290,17 +298,17 @@ final class StemCache {
             return List.of();
         }
         try (var paths = Files.list(root)) {
-            return paths.filter(p -> p.getFileName().toString().matches("[a-f0-9]{8}-[a-f0-9]{64}\\.stems"))
+            return paths.filter(p -> p.getFileName().toString().matches("[a-f0-9]{8}-(?:quick-)?[a-f0-9]{64}\\.stems"))
                     .filter(p -> Files.isRegularFile(p, LinkOption.NOFOLLOW_LINKS))
                     .toList();
         }
     }
 
-    private Path entryPath(Identity id) {
+    private Path entryPath(Identity id, boolean quick) {
         if (!id.digest.matches("[a-f0-9]{64}")) {
             throw new IllegalArgumentException("Invalid source identity");
         }
-        return root.resolve(MODEL + id.digest + ".stems");
+        return root.resolve(MODEL + (quick ? "quick-" : "") + id.digest + ".stems");
     }
 
     private void recycle(Path file) throws IOException {

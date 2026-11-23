@@ -3,7 +3,6 @@ package dev.gaboron.spwtrackmix;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.concurrent.CancellationException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ScheduledExecutorService;
@@ -22,8 +21,17 @@ final class TrackMixSession implements AutoCloseable {
     }
 
     record Selection(Track track, StemCache.Identity identity, StemCache.Entry entry, String error) {}
-    record Status(Selection selection, MixSettings mix, boolean attached, Job job, String notice, long cacheBytes,
-                  boolean modelReady) {}
+    record Status(Selection selection, MixSettings mix, boolean attached, TrackMixJobs.Snapshot queue,
+                  String notice, long cacheBytes, boolean modelReady) {
+        boolean canSeparate() {
+            return !queue.currentQueued() && selection != null && selection.identity != null
+                    && (selection.entry == null || selection.entry.quick());
+        }
+
+        boolean canQuickSeparate() {
+            return canSeparate() && selection.entry == null;
+        }
+    }
 
     private record Playback(Selection selection, MixSettings mix) {
         private static final Playback EMPTY = new Playback(null, MixSettings.DEFAULT);
@@ -43,13 +51,13 @@ final class TrackMixSession implements AutoCloseable {
     private final ScheduledExecutorService preloader = Executors.newSingleThreadScheduledExecutor(
             task -> thread(task, "Track Mix preload"));
     private final ExecutorService worker = Executors.newSingleThreadExecutor(task -> thread(task, "Track Mix worker"));
+    private final TrackMixJobs jobs = new TrackMixJobs(worker, this::refreshStorage);
     private final AtomicLong cacheRevision = new AtomicLong();
     private final Object configurationLock = new Object();
     private volatile TrackMixOptions options;
     private TrackMixOptions saved;
     private final Object playbackLock = new Object();
     private volatile Playback playback = Playback.EMPTY;
-    private volatile Job job;
     private volatile boolean closed;
     private volatile boolean modelReady;
     private volatile long cacheBytes;
@@ -107,8 +115,9 @@ final class TrackMixSession implements AutoCloseable {
         Playback current = playback;
         Selection selected = current.selection;
         var active = effects;
+        var queue = jobs.snapshot(selected == null || selected.identity == null ? null : selected.identity.digest());
         return new Status(selected, current.mix, selected != null && active != null
-                && active.attached(selected.track.path, selected.entry), job, notice, cacheBytes, modelReady);
+                && active.attached(selected.track.path, selected.entry), queue, notice, cacheBytes, modelReady);
     }
 
     TrackMixOptions options() {
@@ -144,24 +153,27 @@ final class TrackMixSession implements AutoCloseable {
         }
     }
 
-    void separate() {
-        Selection selected = playback.selection;
-        if (selected == null || selected.identity == null) {
+    void separate(boolean quick) {
+        Selection before = playback.selection;
+        Selection selected = refreshSelection();
+        if (before == null || selected == null || !before.track.sameSource(selected.track)
+                || selected.identity == null || (selected.entry != null && (quick || !selected.entry.quick()))) {
             return;
         }
         TrackMixOptions parameters = options;
-        submit(selected.track.title, task -> separateTrack(selected, parameters, task));
+        jobs.separate(selected.track.title, selected.identity.digest(), quick,
+                task -> separateTrack(selected, parameters, quick, task));
     }
 
     void prepareModel() {
-        submit("BS-RoFormer SW Fixed", task -> {
+        jobs.maintain("BS-RoFormer SW Fixed", task -> {
             engine.prepareModel(task);
             return "模型已就绪";
         });
     }
 
     void removeModel() {
-        submit("模型", task -> {
+        jobs.maintain("模型", task -> {
             engine.removeModel();
             return "模型文件已移入回收站";
         });
@@ -170,7 +182,7 @@ final class TrackMixSession implements AutoCloseable {
     void clearCurrent() {
         Selection selected = playback.selection;
         if (selected != null && selected.identity != null) {
-            submit(selected.track.title, task -> {
+            jobs.maintain(selected.track.title, task -> {
                 bypassCurrent();
                 cache.clear(selected.identity);
                 return "当前歌曲缓存已移入回收站";
@@ -179,14 +191,14 @@ final class TrackMixSession implements AutoCloseable {
     }
 
     void clearAll() {
-        submit("音轨缓存", task -> {
+        jobs.maintain("音轨缓存", task -> {
             bypassCurrent();
             cache.evict(0, null);
             return "音轨缓存已移入回收站";
         });
     }
 
-    private String separateTrack(Selection selected, TrackMixOptions parameters, PythonEngine.Task task)
+    private String separateTrack(Selection selected, TrackMixOptions parameters, boolean quick, PythonEngine.Task task)
             throws IOException, InterruptedException {
         Path stagingParent = data.resolve("jobs");
         Files.createDirectories(stagingParent);
@@ -201,11 +213,17 @@ final class TrackMixSession implements AutoCloseable {
             AudioFormat format = bass().decode(selected.track.path, input, parameters.cacheBytes(),
                     progress -> task.report("decode", progress));
             task.check();
-            engine.separate(task, input, output, format.rate(), parameters);
+            engine.separate(task, input, output, format.rate(), parameters, quick);
             task.check();
             task.report("cache", 0);
-            cache.publish(selected.identity, format.rate(), format.frames(), output, input, staging, options.cacheBytes());
-            return "六轨分离已完成";
+            var entry = cache.publish(selected.identity, format.rate(), format.frames(), output, input, staging,
+                    options.cacheBytes(), quick);
+            var current = playback.selection;
+            if (current != null && current.identity != null
+                    && current.identity.digest().equals(selected.identity.digest())) {
+                publishSelection(current, new Selection(current.track, current.identity, entry, ""));
+            }
+            return quick ? "快速分离已完成" : "标准分离已完成";
         } finally {
             Thread.interrupted();
             if (staging.getParent().equals(stagingParent) && Files.isDirectory(staging)) {
@@ -218,43 +236,8 @@ final class TrackMixSession implements AutoCloseable {
         }
     }
 
-    private synchronized void submit(String title, Work work) {
-        if (closed || job != null) {
-            return;
-        }
-        Job started = new Job(title);
-        job = started;
-        notice = "";
-        worker.execute(() -> {
-            started.thread = Thread.currentThread();
-            try {
-                started.task.check();
-                notice = work.run(started.task);
-            } catch (CancellationException | InterruptedException error) {
-                notice = "已取消";
-            } catch (Exception error) {
-                notice = started.task.cancelled() ? "已取消" : display(error);
-                if (!started.task.cancelled()) {
-                    LOG.log(System.Logger.Level.WARNING, "Track Mix operation failed", error);
-                }
-            } finally {
-                Thread.interrupted();
-                started.thread = null;
-                refreshStorage();
-                job = null;
-            }
-        });
-    }
-
-    void cancel() {
-        Job running = job;
-        if (running != null) {
-            running.task.cancel();
-            Thread executing = running.thread;
-            if (executing != null) {
-                executing.interrupt();
-            }
-        }
+    void cancel(int id) {
+        jobs.cancel(id);
     }
 
     private Selection refreshSelection() {
@@ -417,7 +400,7 @@ final class TrackMixSession implements AutoCloseable {
             active = effects;
             effects = null;
         }
-        cancel();
+        jobs.close();
         monitor.shutdownNow();
         preloader.shutdownNow();
         worker.shutdownNow();
@@ -435,25 +418,5 @@ final class TrackMixSession implements AutoCloseable {
 
     private static String display(Exception error) {
         return error.getMessage() == null ? error.getClass().getSimpleName() : error.getMessage();
-    }
-
-    @FunctionalInterface
-    private interface Work {
-        String run(PythonEngine.Task task) throws IOException, InterruptedException;
-    }
-
-    static final class Job {
-        final String title;
-        volatile String stage = "";
-        volatile double progress;
-        volatile Thread thread;
-        final PythonEngine.Task task = new PythonEngine.Task((stage, progress) -> {
-            this.stage = stage;
-            this.progress = progress;
-        });
-
-        Job(String title) {
-            this.title = title;
-        }
     }
 }

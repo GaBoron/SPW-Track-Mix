@@ -56,19 +56,6 @@ import kotlin.math.roundToInt
 private val trackNames = listOf("人声", "鼓组", "贝斯", "吉他", "钢琴", "其他")
 private val presetNames = listOf("原曲", "纯伴奏", "仅人声", "自定义")
 
-private data class ScreenState(
-    val status: TrackMixSession.Status,
-    val stage: String,
-    val fraction: Double
-) {
-    companion object {
-        fun read(session: TrackMixSession): ScreenState {
-            val status = session.status()
-            return ScreenState(status, status.job()?.stage.orEmpty(), status.job()?.progress ?: 0.0)
-        }
-    }
-}
-
 @Composable
 internal fun TrackMixerDialog(session: TrackMixSession, dismiss: () -> Unit) {
     BasicAdaptiveDialog(dismiss, AdaptiveDialogSize.Max) {
@@ -78,11 +65,11 @@ internal fun TrackMixerDialog(session: TrackMixSession, dismiss: () -> Unit) {
 
 @Composable
 internal fun TrackMixerContent(session: TrackMixSession, dismiss: () -> Unit) {
-    var state by remember { mutableStateOf(ScreenState.read(session)) }
+    var state by remember { mutableStateOf(session.status()) }
     var options by remember { mutableStateOf(session.options()) }
     var manage by remember { mutableStateOf(false) }
     val update = {
-        state = ScreenState.read(session)
+        state = session.status()
         options = session.options()
     }
     LaunchedEffect(session) {
@@ -105,59 +92,54 @@ internal fun TrackMixerContent(session: TrackMixSession, dismiss: () -> Unit) {
                 size = ControlSize.Small)
         }
         if (manage) {
-            ModelAndCache(session, state.status, options) {
+            ModelAndCache(session, state, options) {
                 manage = false
                 update()
             }
         } else {
-            MixerBody(session, state, state.status.mix(), update) { manage = true }
+            MixerBody(session, state, state.mix(), update) { manage = true }
         }
     }
 }
 
 @Composable
-private fun MixerBody(session: TrackMixSession, state: ScreenState, mix: MixSettings,
+private fun MixerBody(session: TrackMixSession, state: TrackMixSession.Status, mix: MixSettings,
                       update: () -> Unit, manage: () -> Unit) {
-    val current = state.status.selection()
+    val current = state.selection()
     val cached = current?.entry() != null
-    val ready = cached && state.status.attached()
-    val job = state.status.job()
+    val ready = cached && state.attached()
+    val quickCached = current?.entry()?.quick() == true
     Text(current?.track()?.title() ?: "当前歌曲", style = SaltTheme.textStyles.main,
         maxLines = 1, overflow = TextOverflow.Ellipsis)
     val status = when {
         current == null -> "请在 SPW 中播放本地立体声歌曲"
         current.error().isNotBlank() -> current.error()
+        ready && quickCached -> if (mix.original()) "快速分离已缓存 · 原曲直通" else "快速分离 · 实时混音"
         ready && mix.original() -> "六轨已缓存 · 原曲直通"
         ready -> "六轨已缓存 · 实时混音"
         cached -> "六轨已缓存 · 重新打开这首歌以接入混音"
+        state.queue().currentQueued() -> "原曲直通 · 已加入分离队列"
         else -> "原曲直通 · 当前歌曲尚无六轨缓存"
     }
     Text(status, style = SaltTheme.textStyles.sub, color = SaltTheme.colors.subText)
 
-    if (job != null) {
-        val suffix = if (state.fraction > 0 && state.fraction < 1) " ${(state.fraction * 100).roundToInt()}%" else ""
-        Text("${job.title} · ${jobLabel(state.stage)}$suffix",
-            style = SaltTheme.textStyles.sub, color = SaltTheme.colors.subText)
-        Box(Modifier.fillMaxWidth().height(3.dp).clip(SaltTheme.shapes.small).background(SaltTheme.colors.stroke)) {
-            Box(Modifier.fillMaxHeight().fillMaxWidth(state.fraction.toFloat().coerceIn(0f, 1f))
-                .background(SaltTheme.colors.highlight))
-        }
-    } else if (state.status.notice().isNotBlank()) {
-        Text(state.status.notice(), style = SaltTheme.textStyles.sub, color = SaltTheme.colors.subText,
+    if (state.notice().isNotBlank()) {
+        Text(state.notice(), style = SaltTheme.textStyles.sub, color = SaltTheme.colors.subText,
             maxLines = 3, overflow = TextOverflow.Ellipsis)
     }
-
     FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-        if (!cached && job == null) {
-            Button(onClick = { session.separate(); update() }, text = "分离六轨",
-                enabled = current?.identity() != null, size = ControlSize.Small)
+        if (state.canSeparate()) {
+            Button(onClick = { session.separate(false); update() }, text = "标准分离", size = ControlSize.Small)
         }
-        if (job != null) {
-            Button(onClick = session::cancel, text = "取消", appearance = ButtonAppearance.Subtle,
-                size = ControlSize.Small)
+        if (state.canQuickSeparate()) {
+            Button(onClick = { session.separate(true); update() }, text = "快速分离",
+                appearance = ButtonAppearance.Subtle, size = ControlSize.Small)
         }
-        Button(onClick = manage, text = "模型和缓存", enabled = job == null,
-            appearance = ButtonAppearance.Subtle, size = ControlSize.Small)
+        Button(onClick = manage, text = "模型和缓存", appearance = ButtonAppearance.Subtle, size = ControlSize.Small)
+    }
+    SeparationQueue(state.queue()) { id ->
+        session.cancel(id)
+        update()
     }
 
     FlowRow(horizontalArrangement = Arrangement.spacedBy(5.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -205,6 +187,45 @@ private fun MixerBody(session: TrackMixSession, state: ScreenState, mix: MixSett
 }
 
 @Composable
+private fun SeparationQueue(queue: TrackMixJobs.Snapshot, cancel: (Int) -> Unit) {
+    val items = queue.items()
+    if (items.isNotEmpty()) {
+        Text("后台任务", style = SaltTheme.textStyles.main)
+        items.forEachIndexed { index, job ->
+            val kind = when (job.kind()) {
+                TrackMixJobs.Kind.STANDARD -> "标准分离"
+                TrackMixJobs.Kind.QUICK -> "快速分离"
+                else -> "模型和缓存"
+            }
+            val fraction = job.progress().fraction().coerceIn(0.0, 1.0)
+            val progress = when {
+                job.cancelling() -> "正在取消"
+                !job.running() -> "排队 · 第 $index 位"
+                fraction in 0.001..0.999 -> "${jobLabel(job.progress().stage())} ${(fraction * 100).roundToInt()}%"
+                else -> jobLabel(job.progress().stage())
+            }
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                Column(Modifier.weight(1f)) {
+                    Text(job.title(), style = SaltTheme.textStyles.main, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Text("$kind · $progress", style = SaltTheme.textStyles.sub, color = SaltTheme.colors.subText)
+                }
+                Button(onClick = { cancel(job.id()) }, text = "取消", enabled = !job.cancelling(),
+                    appearance = ButtonAppearance.Subtle, size = ControlSize.Small)
+            }
+            Box(Modifier.fillMaxWidth().height(3.dp).clip(SaltTheme.shapes.small).background(SaltTheme.colors.stroke)) {
+                Box(Modifier.fillMaxHeight().fillMaxWidth(if (job.running()) fraction.toFloat() else 0f)
+                    .background(SaltTheme.colors.highlight))
+            }
+        }
+    }
+    if (queue.notice().isNotBlank()) {
+        Text(queue.notice(), style = SaltTheme.textStyles.sub, color = SaltTheme.colors.subText,
+            maxLines = 3, overflow = TextOverflow.Ellipsis)
+    }
+}
+
+@Composable
 private fun ModelAndCache(session: TrackMixSession, status: TrackMixSession.Status, options: TrackMixOptions,
                           finished: () -> Unit) {
     var cacheGiB by remember { mutableStateOf(options.cacheGiB()) }
@@ -212,6 +233,7 @@ private fun ModelAndCache(session: TrackMixSession, status: TrackMixSession.Stat
     var fp16 by remember { mutableStateOf(options.fp16()) }
     var cpu by remember { mutableStateOf(options.cpu()) }
     var confirm by remember { mutableStateOf<String?>(null) }
+    val idle = status.queue().items().isEmpty()
 
     Text("BS-RoFormer SW Fixed", style = SaltTheme.textStyles.main)
     Text(if (status.modelReady()) "模型已下载" else "首次分离时下载模型",
@@ -224,24 +246,24 @@ private fun ModelAndCache(session: TrackMixSession, status: TrackMixSession.Stat
     }
     FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
         Toggle("高质量 TTA", true, quality) { quality = !quality }
-        Toggle("CUDA FP16", !cpu, fp16) { fp16 = !fp16 }
+        Toggle("CUDA FP16", !cpu, fp16 && !cpu) { fp16 = !fp16 }
         Toggle("仅 CPU", true, cpu) { cpu = !cpu }
     }
     FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
         Button(onClick = { session.setOptions(cacheGiB, quality, cpu, fp16); finished() },
             text = "保存设置", size = ControlSize.Small)
-        Button(onClick = { session.prepareModel(); finished() }, text = "准备模型",
+        Button(onClick = { session.prepareModel(); finished() }, text = "准备模型", enabled = idle,
             appearance = ButtonAppearance.Subtle, size = ControlSize.Small)
     }
     Spacer(Modifier.height(2.dp))
     FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
         Button(onClick = { confirm = "当前歌曲缓存" }, text = "清除当前歌曲",
-            enabled = status.selection()?.identity() != null, appearance = ButtonAppearance.Plain,
+            enabled = idle && status.selection()?.identity() != null, appearance = ButtonAppearance.Plain,
             intent = ButtonIntent.Destructive, size = ControlSize.Small)
         Button(onClick = { confirm = "全部音轨缓存" }, text = "清除全部缓存",
-            enabled = status.cacheBytes() > 0, appearance = ButtonAppearance.Plain,
+            enabled = idle && status.cacheBytes() > 0, appearance = ButtonAppearance.Plain,
             intent = ButtonIntent.Destructive, size = ControlSize.Small)
-        Button(onClick = { confirm = "模型文件" }, text = "清除模型",
+        Button(onClick = { confirm = "模型文件" }, text = "清除模型", enabled = idle,
             appearance = ButtonAppearance.Plain, intent = ButtonIntent.Destructive, size = ControlSize.Small)
     }
     confirm?.let { target ->
@@ -254,7 +276,7 @@ private fun ModelAndCache(session: TrackMixSession, status: TrackMixSession.Stat
                     "模型文件" -> session.removeModel()
                 }
                 finished()
-            }, text = "确认", intent = ButtonIntent.Destructive, size = ControlSize.Small)
+            }, text = "确认", enabled = idle, intent = ButtonIntent.Destructive, size = ControlSize.Small)
             Button(onClick = { confirm = null }, text = "取消", appearance = ButtonAppearance.Plain,
                 size = ControlSize.Small)
         }
@@ -284,5 +306,5 @@ private fun jobLabel(stage: String): String = when (stage) {
     "cpu" -> "CPU 分离"
     "fallback" -> "切换推理设备或精度"
     "finish", "cache", "done" -> "写入六轨缓存"
-    else -> "正在处理"
+    else -> "准备开始"
 }

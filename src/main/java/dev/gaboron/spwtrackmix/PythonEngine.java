@@ -51,7 +51,7 @@ final class PythonEngine {
         }
     }
 
-    void separate(Task task, Path input, Path output, int rate, TrackMixOptions options)
+    void separate(Task task, Path input, Path output, int rate, TrackMixOptions options, boolean quick)
             throws IOException, InterruptedException {
         Path script = workerScript();
         ensureRuntime(task);
@@ -64,7 +64,9 @@ final class PythonEngine {
         if (options.fp16()) {
             command.add("--fp16");
         }
-        if (options.quality()) {
+        if (quick) {
+            command.add("--quick");
+        } else if (options.quality()) {
             command.add("--quality");
         }
         run(task, command);

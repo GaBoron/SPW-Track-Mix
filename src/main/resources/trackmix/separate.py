@@ -71,12 +71,11 @@ def resize(audio, source_rate, target_rate, frames=None):
     return audio if frames is None else audio[:frames]
 
 
-def demix(model, audio, chunk, overlap, stft_hop, device, fp16, progress_base, progress_scale):
+def demix(model, audio, chunk, hop, stft_hop, device, fp16, progress_base, progress_scale):
     import numpy as np
     import torch
 
     frames = len(audio)
-    hop = chunk // overlap
     fade = chunk - hop
     starts = [0]
     while starts[-1] + chunk < frames:
@@ -104,9 +103,9 @@ def demix(model, audio, chunk, overlap, stft_hop, device, fp16, progress_base, p
 
             ramp = min(fade, count)
             window = np.ones(count, dtype=np.float32)
-            if index > 0:
+            if ramp and index > 0:
                 window[:ramp] *= np.arange(1, ramp + 1, dtype=np.float32) / (fade + 1)
-            if end < frames:
+            if ramp and end < frames:
                 window[-ramp:] *= np.arange(ramp, 0, -1, dtype=np.float32) / (fade + 1)
             result[start:end] += block_result * window[:, None, None]
             weights[start:end] += window
@@ -134,7 +133,7 @@ def separate(args):
             or tuple(config["training"]["instruments"]) != MODEL_ORDER):
         raise ValueError("The installed checkpoint configuration does not declare the expected six tracks")
     torch.set_num_threads(max(1, min(6, os.cpu_count() or 1)))
-    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cuda.matmul.allow_tf32 = args.quick
 
     source_size = args.input.stat().st_size
     if source_size == 0 or source_size % 8:
@@ -156,7 +155,7 @@ def separate(args):
     stft_hop = int(config["model"]["stft_hop_length"])
     attempts = []
     if not args.cpu and torch.cuda.is_available():
-        if args.fp16:
+        if args.fp16 or args.quick:
             attempts.append(("cuda", True, chunk))
         attempts.append(("cuda", False, chunk))
         if len(audio) > chunk // 2:
@@ -167,11 +166,14 @@ def separate(args):
         estimates = None
         try:
             model.to(device)
-            overlap = 4 if args.quality else int(config["inference"]["num_overlap"])
-            first_weight = 0.5 if args.quality else 1.0
-            estimates = demix(model, audio, segment, overlap, stft_hop, device, fp16, 0, first_weight)
-            if args.quality:
-                other = demix(model, audio[:, ::-1], segment, overlap, stft_hop, device, fp16, 0.5, 0.5)
+            quality = args.quality and not args.quick
+            overlap = 4 if quality else int(config["inference"]["num_overlap"])
+            # Retain a short crossfade at every join while processing fewer chunks.
+            hop = segment * 7 // 8 if args.quick else segment // overlap
+            first_weight = 0.5 if quality else 1.0
+            estimates = demix(model, audio, segment, hop, stft_hop, device, fp16, 0, first_weight)
+            if quality:
+                other = demix(model, audio[:, ::-1], segment, hop, stft_hop, device, fp16, 0.5, 0.5)
                 estimates += other[:, :, ::-1]
                 estimates *= 0.5
             break
@@ -203,6 +205,7 @@ def main():
     parser.add_argument("--cpu", action="store_true")
     parser.add_argument("--fp16", action="store_true")
     parser.add_argument("--quality", action="store_true")
+    parser.add_argument("--quick", action="store_true")
     args = parser.parse_args()
     if args.input is None:
         model_files(args.models)

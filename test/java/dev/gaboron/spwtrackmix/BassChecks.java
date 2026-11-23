@@ -78,7 +78,7 @@ final class BassChecks {
         }
         Files.write(raw, samples.array());
         return new StemCache(work.resolve("cache"), WindowsRecycle::recycle)
-                .publish(StemCache.Identity.read(fixture), 44100, count, raw, work.resolve("decoded.f32"), work, Long.MAX_VALUE);
+                .publish(StemCache.Identity.read(fixture), 44100, count, raw, work.resolve("decoded.f32"), work, Long.MAX_VALUE, false);
     }
 
     private static void exercise(SymbolLookup bass, SymbolLookup mixer, BassLibrary library, Path fixture,
