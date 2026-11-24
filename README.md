@@ -8,7 +8,7 @@ SPW Track Mix 是 Salt Player for Windows 的六轨调音台。插件在后台�
 - **分离环境**需安装带 Py Launcher 的 **64 位 Python 3.13**。可用 `py -3.13 --version` 检查启动器能否找到 Python。
 - **首次分离**需联网下载约 700 MB 的模型并安装独立推理环境。CUDA 环境还需数 GiB 磁盘空间。环境和模型准备好后，歌曲分离与混音都可离线使用。
 
-通过[源码构建](#源码构建)取得 `.spmod`，在 SPW 的「创意工坊 → 模组管理 → 导入模组」中选择该文件。启用时允许类转换（`CLASS_TRANSFORM`）和曲库读取（`LIBRARY_READ`），以接入播放链路和获取当前曲目。[SPW 模组安装说明](https://saltplayer.com/workshop/usage)
+从 [GitHub Releases](https://github.com/GaBoron/SPW-Track-Mix/releases/latest) 下载 `.spmod`，也可从[源码构建](#源码构建)取得安装包。在 SPW 的「创意工坊 → 模组管理 → 导入模组」中选择该文件。启用时允许类转换（`CLASS_TRANSFORM`）和曲库读取（`LIBRARY_READ`），以接入播放链路和获取当前曲目。[SPW 模组安装说明](https://saltplayer.com/workshop/usage)
 
 ## 分离与混音
 
