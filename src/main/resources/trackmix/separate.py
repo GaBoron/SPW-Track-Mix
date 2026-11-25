@@ -2,14 +2,19 @@
 import argparse
 import gc
 import hashlib
+import http.client
 import math
 import os
 from pathlib import Path
+import socket
+import ssl
 import sys
+import urllib.error
 import urllib.request
 
 REVISION = "a443a2985534b3bc815ef54a5d446c6a0390f974"
-BASE = f"https://huggingface.co/enerjazzer/BS-ROFO-SW-Fixed/resolve/{REVISION}/"
+# hf-mirror.net serves the checkpoint without a client-side redirect to Hugging Face's CDN.
+MODEL_HOSTS = ("huggingface.co", "hf-mirror.net", "hf-mirror.com")
 WEIGHTS = "BS-Rofo-SW-Fixed.ckpt"
 CONFIG = "BS-Rofo-SW-Fixed.yaml"
 WEIGHTS_HASH = "24e7d35ee9c64415673d3fd33e06a67cac2c103c5df6267ba1576459c775916e"
@@ -18,6 +23,10 @@ WEIGHTS_BYTES = 699412152
 RATE = 44100
 MODEL_ORDER = ("bass", "drums", "other", "vocals", "guitar", "piano")
 CACHE_ORDER = (3, 1, 0, 4, 5, 2)
+
+
+class ModelError(Exception):
+    pass
 
 
 def progress(stage, fraction=0):
@@ -29,33 +38,95 @@ def digest(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def fetch(directory, name, verify, expected_bytes):
+def download(url, pending, expected_bytes, offset):
+    headers = {"Range": f"bytes={offset}-"} if offset else {}
+    progress("download", offset / expected_bytes)
+    with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=20) as source:
+        if source.status == 200:
+            offset = 0
+        elif (source.status != 206 or not offset
+              or source.headers.get("Content-Range") != f"bytes {offset}-{expected_bytes - 1}/{expected_bytes}"):
+            raise ModelError("返回了无效的下载范围")
+
+        received = offset
+        with pending.open("ab" if offset else "wb") as output:
+            while block := source.read(1024 * 1024):
+                received += len(block)
+                if received > expected_bytes:
+                    raise ModelError("文件大小不符")
+                output.write(block)
+                progress("download", received / expected_bytes)
+        if received != expected_bytes:
+            raise ModelError("传输中断")
+    return offset > 0
+
+
+def download_reason(error):
+    if isinstance(error, ModelError):
+        return str(error)
+    if isinstance(error, urllib.error.HTTPError):
+        error.close()
+        return f"HTTP {error.code}"
+    if isinstance(error, urllib.error.URLError):
+        error = error.reason
+    if isinstance(error, ssl.SSLCertVerificationError):
+        return "证书校验失败"
+    if isinstance(error, ssl.SSLError):
+        return "TLS 连接失败"
+    if isinstance(error, TimeoutError):
+        return "连接超时"
+    if isinstance(error, socket.gaierror):
+        return "域名解析失败"
+    if isinstance(error, (ConnectionError, http.client.HTTPException)):
+        return "连接中断"
+    return "连接失败"
+
+
+def fetch(directory, name, expected_hash, expected_bytes):
     target = directory / name
-    if target.is_file() and verify(target):
+    if target.is_file() and target.stat().st_size == expected_bytes and digest(target) == expected_hash:
         return target
+
     pending = target.with_suffix(target.suffix + ".part")
-    with urllib.request.urlopen(BASE + name, timeout=40) as source, pending.open("wb") as output:
-        received = 0
-        while block := source.read(1024 * 1024):
-            received += len(block)
-            if received > expected_bytes:
-                raise ValueError(f"Unexpected download size for {name}")
-            output.write(block)
-            progress("download", received / expected_bytes)
-    if not verify(pending):
-        raise ValueError(f"Download integrity check failed for {name}")
+    failures = []
+    for host in MODEL_HOSTS:
+        offset = pending.stat().st_size if pending.is_file() else 0
+        if offset == expected_bytes and digest(pending) == expected_hash:
+            break
+        url = f"https://{host}/enerjazzer/BS-ROFO-SW-Fixed/resolve/{REVISION}/{name}"
+        try:
+            resumed = download(url, pending, expected_bytes, offset if offset < expected_bytes else 0)
+            checksum = digest(pending)
+            if checksum != expected_hash and resumed:
+                # A stale partial file may have contributed the bad bytes.
+                download(url, pending, expected_bytes, 0)
+                checksum = digest(pending)
+            if checksum != expected_hash:
+                raise ModelError("完整性校验失败")
+        except (ModelError, urllib.error.URLError, TimeoutError, ConnectionError, ssl.SSLError,
+                http.client.HTTPException) as error:
+            failures.append(download_reason(error))
+            print(f"{host} {name}: {error}", file=sys.stderr, flush=True)
+            continue
+        break
+    else:
+        details = " / ".join(dict.fromkeys(failures))
+        raise ModelError(f"模型下载失败（{details}）。请检查网络或代理，也可手动放入模型文件。")
+
     os.replace(pending, target)
     return target
 
 
 def model_files(directory):
-    directory.mkdir(parents=True, exist_ok=True)
-    progress("verify")
-    checkpoint = fetch(directory, WEIGHTS, lambda p: p.stat().st_size == WEIGHTS_BYTES
-                       and digest(p) == WEIGHTS_HASH, WEIGHTS_BYTES)
-    configuration = fetch(directory, CONFIG, lambda p: p.stat().st_size == 4613
-                          and digest(p) == CONFIG_HASH, 4613)
-    return checkpoint, configuration
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        progress("verify")
+        checkpoint = fetch(directory, WEIGHTS, WEIGHTS_HASH, WEIGHTS_BYTES)
+        configuration = fetch(directory, CONFIG, CONFIG_HASH, 4613)
+        return checkpoint, configuration
+    except OSError as error:
+        print(f"Model storage: {error}", file=sys.stderr, flush=True)
+        raise ModelError("模型文件读写失败。请检查磁盘空间和模型目录权限。") from error
 
 
 def resize(audio, source_rate, target_rate, frames=None):
@@ -217,4 +288,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except ModelError as error:
+        print(f"trackmix\terror\t{error}", flush=True)
+        sys.exit(1)

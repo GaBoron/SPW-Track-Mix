@@ -10,6 +10,13 @@ SPW Track Mix 是 Salt Player for Windows 的六轨调音台。插件在后台�
 
 从 [GitHub Releases](https://github.com/GaBoron/SPW-Track-Mix/releases/latest) 下载 `.spmod`，也可从[源码构建](#源码构建)取得安装包。在 SPW 的「创意工坊 → 模组管理 → 导入模组」中选择该文件。启用时允许类转换（`CLASS_TRANSFORM`）和曲库读取（`LIBRARY_READ`），以接入播放链路和获取当前曲目。[SPW 模组安装说明](https://saltplayer.com/workshop/usage)
 
+如果当前网络无法自动下载模型，可在能访问模型源的设备上下载这两个文件，再拷到 `%LOCALAPPDATA%\SPW Track Mix\models`。再次分离时，插件会校验这两个文件。首次安装推理环境还需访问 PyPI 和 PyTorch 下载站。
+
+| 模型文件 | Hugging Face | 镜像 |
+| --- | --- | --- |
+| `BS-Rofo-SW-Fixed.ckpt` | [下载权重](https://huggingface.co/enerjazzer/BS-ROFO-SW-Fixed/resolve/a443a2985534b3bc815ef54a5d446c6a0390f974/BS-Rofo-SW-Fixed.ckpt) | [下载权重](https://hf-mirror.net/enerjazzer/BS-ROFO-SW-Fixed/resolve/a443a2985534b3bc815ef54a5d446c6a0390f974/BS-Rofo-SW-Fixed.ckpt) |
+| `BS-Rofo-SW-Fixed.yaml` | [下载配置](https://huggingface.co/enerjazzer/BS-ROFO-SW-Fixed/resolve/a443a2985534b3bc815ef54a5d446c6a0390f974/BS-Rofo-SW-Fixed.yaml) | [下载配置](https://hf-mirror.net/enerjazzer/BS-ROFO-SW-Fixed/resolve/a443a2985534b3bc815ef54a5d446c6a0390f974/BS-Rofo-SW-Fixed.yaml) |
+
 ## 分离与混音
 
 1. 播放本地立体声歌曲，从播放页「更多 → 六轨混音」打开调音台。也可以在插件设置中点击「打开六轨调音台」。

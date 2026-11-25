@@ -161,6 +161,7 @@ final class PythonEngine {
         }
 
         var recent = new ArrayDeque<String>();
+        String workerError = "";
         try {
             task.bind(process);
             try (var reader = new BufferedReader(new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))) {
@@ -170,7 +171,11 @@ final class PythonEngine {
                     if (line.startsWith("trackmix\t")) {
                         String[] event = line.split("\t", 3);
                         if (event.length == 3) {
-                            task.report(event[1], Double.parseDouble(event[2]));
+                            if ("error".equals(event[1])) {
+                                workerError = event[2];
+                            } else {
+                                task.report(event[1], Double.parseDouble(event[2]));
+                            }
                         }
                     } else if (!line.isBlank()) {
                         if (recent.size() == 8) {
@@ -183,7 +188,13 @@ final class PythonEngine {
             int exit = process.waitFor();
             task.check();
             if (exit != 0) {
-                throw new WorkerFailure("分离进程退出 " + exit + "。 " + String.join(" ", recent));
+                if (workerError.isBlank()) {
+                    workerError = "分离进程退出 " + exit + "。";
+                    if (!recent.isEmpty()) {
+                        workerError += " " + recent.getLast();
+                    }
+                }
+                throw new WorkerFailure(workerError, String.join("\n", recent));
             }
         } finally {
             task.unbind(process);
@@ -194,8 +205,8 @@ final class PythonEngine {
     }
 
     static class WorkerFailure extends IOException {
-        WorkerFailure(String message) {
-            super(message);
+        WorkerFailure(String message, String diagnostics) {
+            super(message, diagnostics.isEmpty() ? null : new IOException(diagnostics));
         }
     }
 
