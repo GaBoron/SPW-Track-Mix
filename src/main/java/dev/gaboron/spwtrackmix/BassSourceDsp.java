@@ -50,14 +50,17 @@ final class BassSourceDsp implements AutoCloseable {
     }
 
     private final BassLibrary library;
+    private final StemCache cache;
     private final Function<StemCache.Entry, MixSettings> settings;
     private final Supplier<StemCache.Entry> admitted;
     private final List<Registration> registrations = new ArrayList<>();
     private volatile Registration[] forPrefetch = NONE;
     private boolean closed;
 
-    BassSourceDsp(BassLibrary library, Function<StemCache.Entry, MixSettings> settings, Supplier<StemCache.Entry> admitted) {
+    BassSourceDsp(BassLibrary library, StemCache cache, Function<StemCache.Entry, MixSettings> settings,
+                  Supplier<StemCache.Entry> admitted) {
         this.library = library;
+        this.cache = cache;
         this.settings = settings;
         this.admitted = admitted;
     }
@@ -196,7 +199,8 @@ final class BassSourceDsp implements AutoCloseable {
             }
             if (openingWindow == null || openingWindow.entry() != entry) {
                 openingWindow = frame == 0 && covers(window, entry, 0, ahead) ? window
-                        : StemCache.readWindow(entry, 0, Math.min(entry.frames(), entry.rate()));
+                        : cache.readWindow(entry, 0,
+                                Math.min(entry.frames(), Math.min(entry.rate(), StemCache.MAX_WINDOW_FRAMES)));
             }
         }
 
@@ -206,8 +210,8 @@ final class BassSourceDsp implements AutoCloseable {
 
         private StemCache.Window readWindow(StemCache.Entry entry, int frame) throws IOException {
             int start = Math.max(0, frame - Math.min(format.rate() / 4, 24_000));
-            int count = Math.min(entry.frames() - start, Math.min(format.rate() * 2, 192_000));
-            return StemCache.readWindow(entry, start, count);
+            int count = Math.min(entry.frames() - start, Math.min(format.rate() * 2, StemCache.MAX_WINDOW_FRAMES));
+            return cache.readWindow(entry, start, count);
         }
 
         private boolean covers(StemCache.Window candidate, StemCache.Entry entry, long frame, int frames) {

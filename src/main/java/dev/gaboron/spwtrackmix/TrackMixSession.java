@@ -98,7 +98,7 @@ final class TrackMixSession implements AutoCloseable {
             }
             refreshSelection();
             if (effects == null) {
-                effects = new BassSourceDsp(bass(), this::mixFor, () -> playback.entry());
+                effects = new BassSourceDsp(bass(), cache, this::mixFor, () -> playback.entry());
             }
             effects.attach(channel, source.normalize());
         } catch (Throwable error) {
@@ -242,7 +242,7 @@ final class TrackMixSession implements AutoCloseable {
                 throw new IOException("音频已变更，请重试");
             }
             task.report("decode", 0);
-            AudioFormat format = bass().decode(selected.track.path, input, parameters.cacheBytes(),
+            AudioFormat format = bass().decode(selected.track.path, input,
                     progress -> task.report("decode", progress));
             task.check();
             engine.separate(task, input, output, format.rate(), parameters, quick);
@@ -470,6 +470,7 @@ final class TrackMixSession implements AutoCloseable {
         monitor.shutdownNow();
         preloader.shutdownNow();
         worker.shutdownNow();
+        cache.close();
         if (active != null) {
             active.close();
         }

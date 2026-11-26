@@ -6,10 +6,8 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
-import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardOpenOption;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
@@ -19,6 +17,7 @@ import javax.management.ObjectName;
 import java.lang.management.ManagementFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.zip.CRC32C;
 
 final class PcmChecks {
     private static final ValueLayout.OfFloat FLOAT = ValueLayout.JAVA_FLOAT_UNALIGNED;
@@ -35,7 +34,7 @@ final class PcmChecks {
                     samples[start + 1] = -samples[start];
                 }
             }
-            var entry = new StemCache.Entry(Path.of("fixture"), 44100, FRAMES, 0,
+            var entry = new StemCache.Entry(Path.of("fixture"), 44100, FRAMES,
                     new float[]{0.05f, 0.10f, 0.15f, 0.20f, 0.25f, 0.30f}, 0, null, false);
             var window = new StemCache.Window(entry, 0, samples);
             var buffer = arena.allocate(500 * AudioFormat.FLOAT_FRAME_BYTES);
@@ -167,23 +166,28 @@ final class PcmChecks {
 
     private static void cacheChecks() throws IOException {
         Path directory = Files.createTempDirectory("spw-track-mix-cache-check-").toAbsolutePath().normalize();
-        try {
+        Path cacheDir = directory.resolve("cache");
+        Path retired = directory.resolve("retired");
+        try (var cache = new StemCache(cacheDir, path ->
+                Files.move(path, Files.createTempDirectory(retired, "entry-").resolve(path.getFileName())))) {
+            Files.createDirectory(retired);
             Path source = Files.writeString(directory.resolve("track"), "first source");
             Path other = Files.writeString(directory.resolve("other"), "second source");
-            Path raw = directory.resolve("six.f32");
-            var data = ByteBuffer.allocate(FRAMES * StemCache.BYTES_PER_FRAME).order(ByteOrder.LITTLE_ENDIAN);
-            while (data.hasRemaining()) {
-                data.putFloat(0.125f);
+            Path raw = directory.resolve("六轨.f32");
+            int cacheFrames = 2 * 8192 + 353;
+            var data = ByteBuffer.allocate(cacheFrames * StemCache.BYTES_PER_FRAME).order(ByteOrder.LITTLE_ENDIAN);
+            for (int frame = 0; frame < cacheFrames; frame++) {
+                for (int stem = 0; stem < MixSettings.STEMS; stem++) {
+                    data.putFloat(frame % 5 == 0 ? -0f : .125f);
+                    data.putFloat(frame % 7 == 0 ? 0f : -.125f);
+                }
             }
             Files.write(raw, data.array());
-            Path cacheDir = directory.resolve("cache");
-            Path retired = Files.createDirectory(directory.resolve("retired"));
-            var cache = new StemCache(cacheDir, path ->
-                    Files.move(path, Files.createTempDirectory(retired, "entry-").resolve(path.getFileName())));
             var identity = StemCache.Identity.read(source);
-            var rough = cache.publish(identity, 48000, FRAMES, raw, null, directory, Long.MAX_VALUE, true);
+            long compressedBudget = data.capacity() / 2;
+            var rough = cache.publish(identity, 48000, cacheFrames, raw, null, directory, compressedBudget, true);
             require(rough.quick() && cache.lookup(identity).quick(), "rough extraction was not reusable");
-            var entry = cache.publish(identity, 48000, FRAMES, raw, null, directory, Long.MAX_VALUE, false);
+            var entry = cache.publish(identity, 48000, cacheFrames, raw, null, directory, compressedBudget, false);
             require(!cache.lookup(identity).quick() && cache.lookup(identity).path().equals(entry.path())
                     && Files.isRegularFile(rough.path()), "standard output must take priority over the rough result");
             var unnamed = cache.catalog(null, "").getFirst();
@@ -192,40 +196,83 @@ final class PcmChecks {
             var named = cache.catalog(identity.digest(), "测试歌曲").getFirst();
             require(named.bytes() == Files.size(rough.path()) + Files.size(entry.path())
                     && named.quick() && named.standard(), "the catalog did not combine both profiles and their sizes");
-            require(new StemCache(cacheDir, WindowsRecycle::recycle).catalog(null, "").getFirst().displayName()
-                    .equals("测试歌曲"), "the song name did not survive reopening the cache");
+            try (var reopened = new StemCache(cacheDir, WindowsRecycle::recycle)) {
+                require(reopened.catalog(null, "").getFirst().displayName().equals("测试歌曲"),
+                        "the song name did not survive reopening the cache");
+                require(reopened.lookup(identity).rate() == 48000, "JEMA cache was unreadable after reopening");
+            }
             cache.clear(identity.digest());
             require(cache.lookup(identity) == null && !Files.exists(rough.path()), "clearing a track must clear both versions");
             require(cache.catalog(null, "").isEmpty(), "the catalog did not reflect deletion");
-            entry = cache.publish(identity, 48000, FRAMES, raw, null, directory, Long.MAX_VALUE, false);
-            require(cache.lookup(identity).crc() == entry.crc(), "cached data not reused");
-            var window = StemCache.readWindow(entry, 102, 100);
-            require(window.covers(102, 100) && !window.covers(101, 100), "window seek bounds");
-            require(window.samples()[1199] == 0.125f && entry.peak(5) == 0.125f, "PCM lost precision");
+            entry = cache.publish(identity, 48000, cacheFrames, raw, null, directory, compressedBudget, false);
+            require(entry.path().toString().endsWith(".jema") && Files.size(entry.path()) < compressedBudget,
+                    "the cache limit must use compressed bytes");
+            int start = 8192 - 13;
+            var window = cache.readWindow(entry, start, 100);
+            require(window.covers(start, 100) && !window.covers(start - 1, 100), "window seek bounds");
+            for (int lane = 0; lane < window.samples().length; lane++) {
+                int offset = (start * StemCache.FLOATS_PER_FRAME + lane) * Float.BYTES;
+                require(Float.floatToRawIntBits(window.samples()[lane]) == data.getInt(offset),
+                        "PCM bits changed across a JEMA block boundary");
+            }
+            require(entry.peak(5) == .125f, "JEMA metadata lost the stem peak");
+            require(cache.readWindow(entry, cacheFrames - 12, 12).end() == cacheFrames,
+                    "the partial final JEMA block could not be read");
+
+            var crc = new CRC32C();
+            crc.update(data.array());
+            var legacy = ByteBuffer.allocate(48 + data.capacity()).order(ByteOrder.LITTLE_ENDIAN);
+            legacy.putInt(0x58494d54).putInt(1).putInt(48000).putInt(cacheFrames).putLong(crc.getValue());
+            for (int track = 0; track < MixSettings.STEMS; track++) legacy.putFloat(.125f);
+            legacy.put(data.array());
+            Path oldPath = Files.write(entry.path().resolveSibling("a443a298-" + identity.digest() + ".stems"),
+                    legacy.array());
+            require(cache.lookup(identity).path().equals(entry.path()), "JEMA should take priority over same-quality legacy");
+
             var bytes = Files.readAllBytes(entry.path());
-            int baseBytes = entry.headerBytes() - LoudnessProfile.BYTES;
-            var legacy = ByteBuffer.allocate(baseBytes + data.capacity()).order(ByteOrder.LITTLE_ENDIAN);
-            legacy.put(bytes, 0, baseBytes).put(bytes, entry.headerBytes(), data.capacity()).putInt(4, 1);
-            Files.write(entry.path(), legacy.array());
+            bytes[bytes.length - 1] ^= 1;
+            Files.write(entry.path(), bytes);
             var oldCache = cache.lookup(identity);
-            require(oldCache.headerBytes() == baseBytes, "legacy cache header not accepted");
+            require(oldCache.path().equals(oldPath), "legacy cache fallback was not accepted");
             near(oldCache.loudness().gainFor(MixSettings.DEFAULT.withPreset(MixSettings.Preset.VOCALS)), 6,
                     "legacy loudness estimated from all stems");
-            near(StemCache.readWindow(oldCache, 102, 100).samples()[1199], .125f, "legacy PCM offset");
+            near(cache.readWindow(oldCache, 102, 100).samples()[1199], -.125f, "legacy PCM offset");
+            var versionTwo = ByteBuffer.allocate(legacy.capacity() + LoudnessProfile.BYTES).order(ByteOrder.LITTLE_ENDIAN);
+            versionTwo.put(legacy.array(), 0, 48).putInt(4, 2);
+            entry.loudness().write(versionTwo);
+            versionTwo.put(data.array());
+            Files.write(oldPath, versionTwo.array());
+            var previous = cache.lookup(identity);
+            require(previous.path().equals(oldPath) && previous.legacyHeaderBytes() == 48 + LoudnessProfile.BYTES,
+                    "the previous cache's persisted loudness metadata could not be read");
+            near(cache.readWindow(previous, 102, 100).samples()[1199], -.125f, "version 2 PCM offset");
+            bytes[bytes.length - 1] ^= 1;
             Files.write(entry.path(), bytes);
-            long size = cache.size();
-            var second = cache.publish(StemCache.Identity.read(other), 48000, FRAMES, raw, null, directory, size, false);
-            require(cache.size() == size && cache.lookup(identity) == null, "old cache not evicted");
-            try (var file = FileChannel.open(second.path(), StandardOpenOption.WRITE)) {
-                file.position(file.size() - 1);
-                file.write(ByteBuffer.wrap(new byte[]{-1}));
-            }
+            long size = Files.size(entry.path());
+            var otherIdentity = StemCache.Identity.read(other);
+            Path limited = Files.createDirectory(directory.resolve("over-budget"));
             try {
-                cache.lookup(StemCache.Identity.read(other));
-                throw new AssertionError("corruption accepted");
+                cache.publish(otherIdentity, 48000, cacheFrames, raw, null, limited, size - 1, false);
+                throw new AssertionError("oversized JEMA cache was published");
+            } catch (IOException expected) {
+                require(Files.isRegularFile(entry.path()) && Files.isRegularFile(oldPath)
+                        && cache.lookup(otherIdentity) == null, "failed publishing evicted valid caches");
+            }
+            var second = cache.publish(otherIdentity, 48000, cacheFrames, raw, null, directory, size, false);
+            require(cache.size() == size && cache.lookup(identity) == null, "old cache not evicted");
+            bytes = Files.readAllBytes(second.path());
+            // The revision 1 header and six channel-count fields occupy the first 60 bytes.
+            bytes[60] ^= 1;
+            Files.write(second.path(), bytes);
+            cache.lookup(otherIdentity);
+            try {
+                cache.readWindow(second, 0, 128);
+                throw new AssertionError("block corruption accepted");
             } catch (IOException expected) {
                 require(expected.getMessage() != null, "corruption reason missing");
             }
+            require(cache.readWindow(second, cacheFrames - 12, 12).end() == cacheFrames,
+                    "a corrupt block invalidated an independent seek");
             Files.writeString(source, "changed source");
             require(!identity.current(), "source rewrite not recognized");
             require(!identity.digest().equals(StemCache.Identity.read(source).digest()), "source checksum did not change");

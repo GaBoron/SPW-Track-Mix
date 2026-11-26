@@ -106,7 +106,7 @@ final class BassLibrary {
         }
     }
 
-    AudioFormat decode(Path source, Path output, long cacheLimit, DoubleConsumer progress) throws IOException {
+    AudioFormat decode(Path source, Path output, DoubleConsumer progress) throws IOException {
         try (var arena = Arena.ofConfined()) {
             MemorySegment name = arena.allocateFrom(source.toString(), StandardCharsets.UTF_16LE);
             int stream = (int) openFile.invokeExact(0, name, 0L, 0L,
@@ -118,9 +118,6 @@ final class BassLibrary {
                 AudioFormat format = format(stream);
                 if (format == null || format.frameBytes() != AudioFormat.FLOAT_FRAME_BYTES) {
                     throw new IOException("当前只支持可定位的本地立体声 PCM 音频");
-                }
-                if ((long) format.frames() * StemCache.BYTES_PER_FRAME + StemCache.HEADER_BYTES > cacheLimit) {
-                    throw new IOException("缓存上限不足以保存这首歌");
                 }
                 writeDecoded(stream, format, output, arena, progress);
                 return format;

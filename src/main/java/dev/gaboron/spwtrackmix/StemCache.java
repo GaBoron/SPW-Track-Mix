@@ -23,20 +23,25 @@ import java.util.Properties;
 import java.util.regex.Pattern;
 import java.util.zip.CRC32C;
 
-final class StemCache {
+final class StemCache implements AutoCloseable {
     static final int FLOATS_PER_FRAME = MixSettings.STEMS * 2;
     static final int BYTES_PER_FRAME = FLOATS_PER_FRAME * Float.BYTES;
+    static final int MAX_WINDOW_FRAMES = 192_000;
     private static final int MAGIC = 0x58494d54;
     private static final int LEGACY_VERSION = 1;
     private static final int VERSION = 2;
     private static final int BASE_HEADER_BYTES = 48;
-    static final int HEADER_BYTES = BASE_HEADER_BYTES + LoudnessProfile.BYTES;
+    private static final int LEGACY_HEADER_BYTES = BASE_HEADER_BYTES + LoudnessProfile.BYTES;
+    private static final int JEMA_METADATA_VERSION = 1;
+    private static final int JEMA_METADATA_BYTES = 2 * Integer.BYTES + MixSettings.STEMS * Float.BYTES
+            + LoudnessProfile.BYTES;
     private static final int CHUNK_BYTES = BYTES_PER_FRAME * 16384;
     private static final String MODEL = "a443a298-";
-    private static final Pattern CACHE_NAME = Pattern.compile("[a-f0-9]{8}-(quick-)?([a-f0-9]{64})\\.stems");
+    private static final Pattern CACHE_NAME = Pattern.compile("[a-f0-9]{8}-(quick-)?([a-f0-9]{64})\\.(?:jema|stems)");
     private static final System.Logger LOG = System.getLogger(StemCache.class.getName());
     private final Path root;
     private final Recycler recycler;
+    private final JemaCodec jema;
 
     @FunctionalInterface
     interface Recycler {
@@ -46,6 +51,7 @@ final class StemCache {
     StemCache(Path root, Recycler recycler) {
         this.root = root.toAbsolutePath().normalize();
         this.recycler = recycler;
+        this.jema = new JemaCodec(this.root.resolveSibling("codec"));
     }
 
     record Identity(Path path, Object fileKey, long length, FileTime modified, String digest) {
@@ -78,7 +84,7 @@ final class StemCache {
         }
     }
 
-    record Entry(Path path, int rate, int frames, long crc, float[] peaks, int headerBytes,
+    record Entry(Path path, int rate, int frames, float[] peaks, int legacyHeaderBytes,
                  LoudnessProfile loudness, boolean quick) {
         Entry {
             peaks = peaks.clone();
@@ -111,73 +117,88 @@ final class StemCache {
     }
 
     synchronized Entry lookup(Identity id) throws IOException {
-        Path path = entryPath(id, false);
-        if (!Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)) {
-            path = entryPath(id, true);
+        IOException failure = null;
+        // Keep the best separation quality, preferring JEMA within each quality.
+        for (Path path : List.of(entryPath(id, false, ".jema"), entryPath(id, false, ".stems"),
+                entryPath(id, true, ".jema"), entryPath(id, true, ".stems"))) {
             if (!Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)) {
-                return null;
+                continue;
+            }
+            try {
+                Entry entry = path.toString().endsWith(".jema") ? readJema(path) : verifyLegacy(path);
+                Files.setLastModifiedTime(path, FileTime.from(Instant.now()));
+                return entry;
+            } catch (IOException error) {
+                checkInterrupted();
+                if (failure == null) failure = error;
             }
         }
-        Entry entry = verify(path);
-        Files.setLastModifiedTime(path, FileTime.from(Instant.now()));
-        return entry;
+        if (failure != null) throw failure;
+        return null;
     }
 
     Entry publish(Identity id, int rate, int frames, Path raw, Path original, Path staging, long limit, boolean quick)
             throws IOException {
         long dataBytes = (long) frames * BYTES_PER_FRAME;
-        if (dataBytes + HEADER_BYTES > limit) {
-            throw new IOException("缓存上限不足以保存这首歌");
-        }
-        if (Files.size(raw) != dataBytes || (original != null
+        if (frames <= 0 || rate < 8000 || rate > 384000 || Files.size(raw) != dataBytes || (original != null
                 && Files.size(original) != (long) frames * AudioFormat.FLOAT_FRAME_BYTES) || !id.current()) {
             throw new IOException("分离输出不完整或音频文件已变更");
         }
         Files.createDirectories(root);
-        Path target = entryPath(id, quick);
-        Path pending = staging.resolve("completed.stems");
+        Path target = entryPath(id, quick, ".jema");
+        Path pending = staging.resolve("completed.jema");
+        ByteBuffer metadata = ordered(JEMA_METADATA_BYTES);
         try (var input = FileChannel.open(raw, StandardOpenOption.READ);
-             var reference = original == null ? null : FileChannel.open(original, StandardOpenOption.READ);
-             var output = FileChannel.open(pending, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)) {
-            var crc = new CRC32C();
+             var reference = original == null ? null : FileChannel.open(original, StandardOpenOption.READ)) {
             var peaks = new float[MixSettings.STEMS];
-            output.position(HEADER_BYTES);
             var analysis = new LoudnessProfile.Analysis(rate);
-            scan(input, output, dataBytes, crc, peaks, analysis, reference);
-            output.position(0);
-            ByteBuffer header = ordered(HEADER_BYTES);
-            header.putInt(MAGIC).putInt(VERSION).putInt(rate).putInt(frames).putLong(crc.getValue());
+            scan(input, dataBytes, null, peaks, analysis, reference);
+            metadata.putInt(MAGIC).putInt(JEMA_METADATA_VERSION);
             for (float peak : peaks) {
-                header.putFloat(peak);
+                metadata.putFloat(peak);
             }
-            analysis.result().write(header);
-            header.flip();
-            write(output, header);
-            output.force(true);
+            analysis.result().write(metadata);
+        }
+        jema.encode(raw, pending, rate, frames, metadata.array());
+        long bytes = Files.size(pending);
+        if (bytes > limit) {
+            throw new IOException("缓存上限不足以保存这首歌");
+        }
+        Entry encoded = readJema(pending);
+        if (encoded.rate != rate || encoded.frames != frames) {
+            throw new IOException("JEMA 缓存长度或格式无效");
         }
 
-        checkInterrupted();
-        if (!id.current()) {
-            throw new IOException("音频文件已变更");
+        synchronized (this) {
+            checkInterrupted();
+            if (!id.current()) {
+                throw new IOException("音频文件已变更");
+            }
+            evict(limit - bytes, target);
+            if (Files.exists(target, LinkOption.NOFOLLOW_LINKS)) {
+                recycle(target);
+            }
+            Files.move(pending, target, StandardCopyOption.ATOMIC_MOVE);
         }
-        evict(limit - (dataBytes + HEADER_BYTES), target);
-        if (Files.exists(target, LinkOption.NOFOLLOW_LINKS)) {
-            recycle(target);
-        }
-        Files.move(pending, target, StandardCopyOption.ATOMIC_MOVE);
-        return verify(target);
+        return new Entry(target, rate, frames, encoded.peaks, 0, encoded.loudness, quick);
     }
 
-    static Window readWindow(Entry entry, int start, int frames) throws IOException {
-        if (start < 0 || frames <= 0 || frames > entry.frames - start) {
+    Window readWindow(Entry entry, int start, int frames) throws IOException {
+        if (start < 0 || frames <= 0 || frames > MAX_WINDOW_FRAMES || frames > entry.frames - start) {
             throw new IOException("音轨缓存帧范围无效");
         }
-        ByteBuffer data = ordered(Math.multiplyExact(frames, BYTES_PER_FRAME));
-        try (var file = FileChannel.open(entry.path, StandardOpenOption.READ)) {
-            file.position(entry.headerBytes + (long) start * BYTES_PER_FRAME);
-            read(file, data);
+        ByteBuffer data;
+        if (entry.legacyHeaderBytes == 0) {
+            data = ByteBuffer.wrap(jema.readFrames(entry.path, entry.rate, entry.frames, start, frames))
+                    .order(ByteOrder.LITTLE_ENDIAN);
+        } else {
+            data = ordered(Math.multiplyExact(frames, BYTES_PER_FRAME));
+            try (var file = FileChannel.open(entry.path, StandardOpenOption.READ)) {
+                file.position(entry.legacyHeaderBytes + (long) start * BYTES_PER_FRAME);
+                read(file, data);
+            }
+            data.flip();
         }
-        data.flip();
         var samples = new float[frames * FLOATS_PER_FRAME];
         data.asFloatBuffer().get(samples);
         for (float sample : samples) {
@@ -188,7 +209,7 @@ final class StemCache {
         return new Window(entry, start, samples);
     }
 
-    long size() throws IOException {
+    synchronized long size() throws IOException {
         long total = 0;
         for (Path file : entries()) {
             total += Files.size(file);
@@ -196,7 +217,7 @@ final class StemCache {
         return total;
     }
 
-    List<CachedTrack> catalog(String namedDigest, String title) throws IOException {
+    synchronized List<CachedTrack> catalog(String namedDigest, String title) throws IOException {
         var groups = new HashMap<String, CachedTrack>();
         for (Path file : entries()) {
             var name = CACHE_NAME.matcher(file.getFileName().toString());
@@ -255,9 +276,9 @@ final class StemCache {
         if (!digest.isEmpty() && !digest.matches("[a-f0-9]{64}")) {
             throw new IllegalArgumentException("Invalid source identity");
         }
-        String suffix = digest + ".stems";
         for (Path file : entries()) {
-            if (file.getFileName().toString().endsWith(suffix)) recycle(file);
+            String name = file.getFileName().toString();
+            if (name.endsWith(digest + ".jema") || name.endsWith(digest + ".stems")) recycle(file);
         }
     }
 
@@ -280,7 +301,25 @@ final class StemCache {
         }
     }
 
-    private Entry verify(Path path) throws IOException {
+    private Entry readJema(Path path) throws IOException {
+        var info = jema.inspect(path);
+        var metadata = ByteBuffer.wrap(info.metadata()).order(ByteOrder.LITTLE_ENDIAN);
+        if (metadata.remaining() != JEMA_METADATA_BYTES || metadata.getInt() != MAGIC
+                || metadata.getInt() != JEMA_METADATA_VERSION) {
+            throw new IOException("JEMA 混音元数据不兼容");
+        }
+        var peaks = new float[MixSettings.STEMS];
+        for (int track = 0; track < peaks.length; track++) {
+            float peak = metadata.getFloat();
+            if (!Float.isFinite(peak) || peak < 0) {
+                throw new IOException("JEMA 混音元数据包含无效峰值");
+            }
+            peaks[track] = peak;
+        }
+        return new Entry(path, info.rate(), info.frames(), peaks, 0, LoudnessProfile.read(metadata), isQuick(path));
+    }
+
+    private Entry verifyLegacy(Path path) throws IOException {
         try (var input = FileChannel.open(path, StandardOpenOption.READ)) {
             var header = ordered(BASE_HEADER_BYTES);
             read(input, header);
@@ -298,7 +337,7 @@ final class StemCache {
                 peaks[track] = header.getFloat();
             }
             long dataBytes = (long) frames * BYTES_PER_FRAME;
-            int headerBytes = version == VERSION ? HEADER_BYTES : BASE_HEADER_BYTES;
+            int headerBytes = version == VERSION ? LEGACY_HEADER_BYTES : BASE_HEADER_BYTES;
             if (rate < 8000 || rate > 384000 || frames <= 0 || input.size() != headerBytes + dataBytes) {
                 throw new IOException("音轨缓存长度或格式无效");
             }
@@ -313,16 +352,20 @@ final class StemCache {
             }
             // Version 1 never stored the source reference, so estimate it from the six stems.
             var analysis = profile == null ? new LoudnessProfile.Analysis(rate) : null;
-            scan(input, null, dataBytes, actual, actualPeaks, analysis, null);
+            scan(input, dataBytes, actual, actualPeaks, analysis, null);
             if (actual.getValue() != checksum || !java.util.Arrays.equals(peaks, actualPeaks)) {
                 throw new IOException("音轨缓存完整性检查失败");
             }
-            return new Entry(path, rate, frames, checksum, peaks, headerBytes,
-                    profile == null ? analysis.result() : profile, path.getFileName().toString().startsWith(MODEL + "quick-"));
+            return new Entry(path, rate, frames, peaks, headerBytes,
+                    profile == null ? analysis.result() : profile, isQuick(path));
         }
     }
 
-    private static void scan(FileChannel input, FileChannel output, long remaining, CRC32C crc, float[] peaks,
+    private static boolean isQuick(Path path) {
+        return path.getFileName().toString().startsWith(MODEL + "quick-");
+    }
+
+    private static void scan(FileChannel input, long remaining, CRC32C crc, float[] peaks,
                              LoudnessProfile.Analysis analysis, FileChannel original) throws IOException {
         var chunk = ordered(CHUNK_BYTES);
         var source = original == null ? null : ordered(CHUNK_BYTES / FLOATS_PER_FRAME * 2);
@@ -332,7 +375,7 @@ final class StemCache {
             chunk.clear().limit(size);
             read(input, chunk);
             chunk.flip();
-            crc.update(chunk.array(), 0, size);
+            if (crc != null) crc.update(chunk.array(), 0, size);
             if (source != null) {
                 source.clear().limit(size / FLOATS_PER_FRAME * 2);
                 read(original, source);
@@ -350,9 +393,6 @@ final class StemCache {
                 if (analysis != null) {
                     analysis.accept(chunk, offset, source, offset / FLOATS_PER_FRAME * 2);
                 }
-            }
-            if (output != null) {
-                write(output, chunk);
             }
             remaining -= size;
         }
@@ -372,11 +412,11 @@ final class StemCache {
                 && Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS);
     }
 
-    private Path entryPath(Identity id, boolean quick) {
+    private Path entryPath(Identity id, boolean quick, String extension) {
         if (!id.digest.matches("[a-f0-9]{64}")) {
             throw new IllegalArgumentException("Invalid source identity");
         }
-        return root.resolve(MODEL + (quick ? "quick-" : "") + id.digest + ".stems");
+        return root.resolve(MODEL + (quick ? "quick-" : "") + id.digest + extension);
     }
 
     private void recycle(Path file) throws IOException {
@@ -396,12 +436,6 @@ final class StemCache {
 
     private static ByteBuffer ordered(int bytes) {
         return ByteBuffer.allocate(bytes).order(ByteOrder.LITTLE_ENDIAN);
-    }
-
-    private static void write(FileChannel channel, ByteBuffer data) throws IOException {
-        while (data.hasRemaining()) {
-            channel.write(data);
-        }
     }
 
     private static void read(FileChannel channel, ByteBuffer data) throws IOException {
@@ -424,5 +458,10 @@ final class StemCache {
         if (Thread.currentThread().isInterrupted()) {
             throw new java.io.InterruptedIOException("操作已取消");
         }
+    }
+
+    @Override
+    public void close() {
+        jema.close();
     }
 }

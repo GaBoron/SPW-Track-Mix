@@ -1,3 +1,6 @@
+import java.net.URI
+import java.security.MessageDigest
+import java.util.HexFormat
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 plugins {
@@ -41,6 +44,56 @@ configurations.runtimeClasspath {
 
 sourceSets.test { java.setSrcDirs(listOf("test/java")) }
 
+val jemaVersion = "1.0.0"
+val jemaArchive = layout.buildDirectory.file("jema/upstream/JEMA-v$jemaVersion-cli.zip")
+val downloadJema = tasks.register("downloadJema") {
+    val url = "https://github.com/GaBoron/JEMA/releases/download/v$jemaVersion/JEMA-v$jemaVersion-cli.zip"
+    val digest = "b91a182c591ebac42e22b30c22843a6fd58dd46e7ff71fa5a61f927c7f2ace11"
+    inputs.property("url", url)
+    inputs.property("sha256", digest)
+    outputs.file(jemaArchive)
+    doLast {
+        val connection = URI(url).toURL().openConnection().apply {
+            connectTimeout = 30_000
+            readTimeout = 30_000
+        }
+        val bytes = connection.getInputStream().use { it.readAllBytes() }
+        val actual = HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(bytes))
+        check(actual == digest) { "Unexpected JEMA $jemaVersion archive checksum" }
+        val archive = jemaArchive.get().asFile
+        archive.parentFile.mkdirs()
+        archive.writeBytes(bytes)
+    }
+}
+
+val unpackJema = tasks.register<Copy>("unpackJema") {
+    dependsOn(downloadJema)
+    from({ zipTree(jemaArchive.get().asFile) })
+    into(layout.buildDirectory.dir("jema/reference"))
+}
+
+val jemaSource = layout.projectDirectory.dir("src/jema")
+val jemaBuild = layout.buildDirectory.dir("jema/dotnet")
+val jemaPublish = layout.buildDirectory.dir("jema/publish")
+val publishJemaCodec = tasks.register<Exec>("publishJemaCodec") {
+    dependsOn(unpackJema)
+    inputs.dir(jemaSource)
+    inputs.files(unpackJema)
+    outputs.dir(jemaPublish)
+    commandLine(
+        "dotnet", "publish", jemaSource.file("TrackMix.Jema.csproj").asFile, "-c", "Release",
+        "--artifacts-path", jemaBuild.get().asFile, "-o", jemaPublish.get().asFile,
+        "-p:JemaReferenceDir=${unpackJema.get().destinationDir.absolutePath}"
+    )
+}
+
+tasks.processResources {
+    from(publishJemaCodec) {
+        include("TrackMix.Jema.exe")
+        into("trackmix")
+    }
+}
+
 spmod {
     PluginId = "dev.gaboron.spwtrackmix"
     PluginClass = "dev.gaboron.spwtrackmix.TrackMixPlugin"
@@ -59,6 +112,13 @@ tasks.named<Zip>("plugin") {
     archiveFileName.set("spw-track-mix-${project.version}.spmod")
     from("README.md")
     into("licenses") { from("licenses") }
+    into("licenses/JEMA") {
+        from(unpackJema.map { it.destinationDir.resolve("licenses") })
+        from(publishJemaCodec) {
+            include("LICENSE.TXT", "THIRD-PARTY-NOTICES.TXT")
+            rename { name -> "dotnet-$name" }
+        }
+    }
 }
 
 val pcmCheck = tasks.register<JavaExec>("pcmCheck") {

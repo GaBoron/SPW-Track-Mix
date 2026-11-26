@@ -40,11 +40,11 @@ SPW Track Mix 是 Salt Player for Windows 的六轨调音台。插件在后台�
 
 ## 缓存与磁盘空间
 
-缓存、模型和推理环境都保存在 `%LOCALAPPDATA%\SPW Track Mix`。音轨以 32 位浮点 PCM 保存，默认缓存上限为 **10 GiB**，可在设置中调整。SPW 原生调音台可在「模型和缓存」中清理当前歌曲或全部音轨。手动删除和自动淘汰的音轨缓存会移入 Windows 回收站。
+缓存、模型和推理环境都保存在 `%LOCALAPPDATA%\SPW Track Mix`。每次分离的六条音轨以一个 `.jema` 文件保存，保留 32 位浮点采样的全部精度。已有的 `.stems` 缓存可直接复用。默认缓存上限为 **10 GiB**，按文件实际大小计算，可在设置中调整。SPW 原生调音台可在「模型和缓存」中清理当前歌曲或全部音轨。手动删除和自动淘汰的音轨缓存会移入 Windows 回收站。
 
 ## 源码构建
 
-在 Windows 上安装 **JDK 25**，从仓库根目录运行 Gradle Wrapper。
+在 Windows 上安装 **JDK 25** 和支持构建 .NET 8 的 **.NET SDK 8 或更新版本**，从仓库根目录运行 Gradle Wrapper。
 
 ```powershell
 .\gradlew.bat check plugin
@@ -55,6 +55,7 @@ SPW Track Mix 是 Salt Player for Windows 的六轨调音台。插件在后台�
 ## 依赖与模型
 
 - SPW Workshop API 和 SaltUI 采用 Apache-2.0。插件包带有 SaltUI 组件及其 Apache-2.0 依赖 Haze、AndroidX 和 JSpecify。音频播放沿用 SPW 提供的 BASS。[SPW Workshop API](https://github.com/Moriafly/spw-workshop-api) · [SaltUI](https://github.com/Moriafly/SaltUI) · [随包附带的许可文本](licenses/Apache-2.0.txt)
+- 插件包带有 JEMA 1.0.0 编解码器和所需 .NET 运行时，安装插件时即可离线使用音轨缓存。[JEMA](https://github.com/GaBoron/JEMA) · [JEMA 许可](licenses/JEMA-MIT.txt) · [JEMA 依赖声明](https://github.com/GaBoron/JEMA/blob/v1.0.0/THIRD-PARTY-NOTICES.md)
 - 首次分离会安装 Audio Separator、PyTorch 及其运行依赖。[Audio Separator 许可证](https://github.com/nomadkaraoke/python-audio-separator/blob/v0.48.0/LICENSE) · [PyTorch 许可证](https://github.com/pytorch/pytorch/blob/v2.10.0/LICENSE)
 - BS-RoFormer SW Fixed 权重由插件按需下载，模型镜像将权重许可证标为未知。[模型镜像](https://huggingface.co/enerjazzer/BS-ROFO-SW-Fixed)
 

@@ -38,7 +38,8 @@ final class BassChecks {
         Path resources = Path.of(args[0]).toAbsolutePath();
         Path fixture = Path.of(args[1]).toAbsolutePath();
         Path workspace = Files.createTempDirectory("spw-track-mix-bass-check-").toAbsolutePath().normalize();
-        try (var arena = Arena.ofShared()) {
+        try (var arena = Arena.ofShared();
+             var cache = new StemCache(workspace.resolve("cache"), WindowsRecycle::recycle)) {
             var bassPath = resources.resolve("bass.dll");
             var bass = SymbolLookup.libraryLookup(bassPath, arena);
             var mixer = SymbolLookup.libraryLookup(resources.resolve("bassmix.dll"), arena);
@@ -48,13 +49,13 @@ final class BassChecks {
             try {
                 var library = BassLibrary.resolveLoaded(bassPath);
                 Path pcm = workspace.resolve("decoded.f32");
-                AudioFormat decoded = library.decode(fixture, pcm, Long.MAX_VALUE, progress -> {});
+                AudioFormat decoded = library.decode(fixture, pcm, progress -> {});
                 require(decoded.rate() == 44100 && decoded.frames() == ProbeSignal.FRAME_COUNT
                         && Files.size(pcm) == ProbeSignal.FRAME_COUNT * 8L, "isolated decode lost frames");
-                var entry = fixtureCache(fixture, workspace);
-                exercise(bass, mixer, library, fixture, entry, arena, FLOAT, 8);
-                exercise(bass, mixer, library, fixture, entry, arena, 0, 4);
-                exerciseConcurrentDetach(bass, mixer, library, fixture, entry);
+                var entry = fixtureCache(cache, fixture, workspace);
+                exercise(bass, mixer, library, fixture, cache, entry, arena, FLOAT, 8);
+                exercise(bass, mixer, library, fixture, cache, entry, arena, 0, 4);
+                exerciseConcurrentDetach(bass, mixer, library, fixture, cache, entry);
             } finally {
                 var free = bind(bass, "BASS_Free", JAVA_INT);
                 require((int) free.invokeExact() != 0, "BASS could not release its no-sound device");
@@ -65,7 +66,7 @@ final class BassChecks {
         System.out.println("Native BASS verified: decode, float and PCM16 DSP, pause, seek recovery, loop, source change and concurrent detach.");
     }
 
-    private static StemCache.Entry fixtureCache(Path fixture, Path work) throws Exception {
+    private static StemCache.Entry fixtureCache(StemCache cache, Path fixture, Path work) throws Exception {
         Path raw = work.resolve("six.f32");
         int count = ProbeSignal.FRAME_COUNT;
         var samples = ByteBuffer.allocate(count * StemCache.BYTES_PER_FRAME).order(ByteOrder.LITTLE_ENDIAN);
@@ -77,12 +78,13 @@ final class BassChecks {
             }
         }
         Files.write(raw, samples.array());
-        return new StemCache(work.resolve("cache"), WindowsRecycle::recycle)
-                .publish(StemCache.Identity.read(fixture), 44100, count, raw, work.resolve("decoded.f32"), work, Long.MAX_VALUE, false);
+        return cache.publish(StemCache.Identity.read(fixture), 44100, count, raw, work.resolve("decoded.f32"), work,
+                Long.MAX_VALUE, false);
     }
 
     private static void exercise(SymbolLookup bass, SymbolLookup mixer, BassLibrary library, Path fixture,
-                                 StemCache.Entry cache, Arena arena, int format, int sourceFrameBytes) throws Throwable {
+                                 StemCache stemCache, StemCache.Entry cache, Arena arena, int format, int sourceFrameBytes)
+            throws Throwable {
         var create = bind(bass, "BASS_StreamCreateFile", JAVA_INT, JAVA_INT, ADDRESS,
                 JAVA_LONG, JAVA_LONG, JAVA_INT);
         var createMixer = bind(mixer, "BASS_Mixer_StreamCreate", JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT);
@@ -99,7 +101,7 @@ final class BassChecks {
         var buffer = arena.allocate(FRAMES * 8, 8);
         var settings = new AtomicReference<>(MixSettings.DEFAULT);
         var admitted = new AtomicReference<>(cache);
-        try (var effects = new BassSourceDsp(library, ignored -> settings.get(), admitted::get)) {
+        try (var effects = new BassSourceDsp(library, stemCache, ignored -> settings.get(), admitted::get)) {
             require(!effects.attach(0, fixture), "invalid channel accepted");
             require(effects.attach(stream, fixture), "could not attach DSP");
             require(!effects.attach(stream, fixture), "duplicate DSP");
@@ -152,7 +154,7 @@ final class BassChecks {
             pull(read, mix, buffer);
             check(buffer, 1200, 0, -1);
         }
-        try (var effects = new BassSourceDsp(library, ignored -> settings.get(), admitted::get)) {
+        try (var effects = new BassSourceDsp(library, stemCache, ignored -> settings.get(), admitted::get)) {
             require(effects.attach(stream, fixture), "replacement adapter could not attach");
             require((int) free.invokeExact(stream) != 0, "fixture stream could not be freed");
             int replacement = (int) create.invokeExact(0, name, 0L, 0L, flags);
@@ -167,7 +169,7 @@ final class BassChecks {
     }
 
     private static void exerciseConcurrentDetach(SymbolLookup bass, SymbolLookup mixer, BassLibrary library, Path fixture,
-                                                 StemCache.Entry cache) throws Throwable {
+                                                 StemCache stemCache, StemCache.Entry cache) throws Throwable {
         var create = bind(bass, "BASS_StreamCreateFile", JAVA_INT, JAVA_INT, ADDRESS,
                 JAVA_LONG, JAVA_LONG, JAVA_INT);
         var createMixer = bind(mixer, "BASS_Mixer_StreamCreate", JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT);
@@ -186,7 +188,7 @@ final class BassChecks {
                 var stopping = new CountDownLatch(1);
                 var failure = new AtomicReference<Throwable>();
                 var mix = MixSettings.DEFAULT.withPreset(MixSettings.Preset.VOCALS);
-                try (var effects = new BassSourceDsp(library, ignored -> {
+                try (var effects = new BassSourceDsp(library, stemCache, ignored -> {
                     entered.countDown();
                     try {
                         if (!resume.await(5, TimeUnit.SECONDS)) {
