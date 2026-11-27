@@ -6,9 +6,13 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.Executor;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
+import java.util.function.LongSupplier;
 
 final class TrackMixJobs implements AutoCloseable {
     private static final System.Logger LOG = System.getLogger(TrackMixJobs.class.getName());
+    private static final long NOTICE_DURATION = TimeUnit.SECONDS.toNanos(8);
 
     enum Kind { STANDARD, QUICK, MAINTENANCE }
 
@@ -26,13 +30,19 @@ final class TrackMixJobs implements AutoCloseable {
                 case "cpu" -> "CPU 分离";
                 case "fallback" -> "切换推理设备或精度";
                 case "finish", "cache", "done" -> "写入音轨缓存";
+                case "cache-directory" -> "切换缓存目录";
                 default -> "正在处理";
             };
             return fraction > 0.001 && fraction < 0.999 ? text + " " + Math.round(fraction * 100) + "%" : text;
         }
     }
     record Item(int id, String title, Kind kind, boolean running, boolean cancelling, Progress progress) {}
-    record Snapshot(List<Item> items, boolean currentQueued, String notice) {}
+    record Snapshot(List<Item> items, boolean currentQueued, String notice, int noticeId) {
+        String noticeAfter(int openedAfter) {
+            return noticeId > openedAfter ? notice : "";
+        }
+    }
+    record Result(String message, boolean success) {}
 
     @FunctionalInterface
     interface Work {
@@ -41,27 +51,39 @@ final class TrackMixJobs implements AutoCloseable {
 
     private final Executor worker;
     private final Runnable refreshStorage;
+    private final LongSupplier nanoTime;
     private final ArrayDeque<Job> waiting = new ArrayDeque<>();
     private int nextId;
     private Job active;
     private String notice = "";
+    private int noticeId;
+    private long noticeStarted;
     private boolean closed;
 
     TrackMixJobs(Executor worker, Runnable refreshStorage) {
+        this(worker, refreshStorage, System::nanoTime);
+    }
+
+    TrackMixJobs(Executor worker, Runnable refreshStorage, LongSupplier nanoTime) {
         this.worker = worker;
         this.refreshStorage = refreshStorage;
+        this.nanoTime = nanoTime;
     }
 
     synchronized void separate(String title, String digest, boolean quick, Work work) {
         if (!closed && !contains(digest)) {
-            queue(title, digest, quick ? Kind.QUICK : Kind.STANDARD, work);
+            queue(title, digest, quick ? Kind.QUICK : Kind.STANDARD, work, null);
         }
     }
 
     synchronized void maintain(String title, Work work) {
-        if (!closed && active == null) {
-            queue(title, null, Kind.MAINTENANCE, work);
-        }
+        maintain(title, work, null);
+    }
+
+    synchronized boolean maintain(String title, Work work, Consumer<Result> finished) {
+        if (closed || active != null) return false;
+        queue(title, null, Kind.MAINTENANCE, work, finished);
+        return true;
     }
 
     synchronized Snapshot snapshot(String digest) {
@@ -72,7 +94,8 @@ final class TrackMixJobs implements AutoCloseable {
         for (Job job : waiting) {
             items.add(job.view(false));
         }
-        return new Snapshot(List.copyOf(items), digest != null && contains(digest), notice);
+        String visibleNotice = nanoTime.getAsLong() - noticeStarted < NOTICE_DURATION ? notice : "";
+        return new Snapshot(List.copyOf(items), digest != null && contains(digest), visibleNotice, noticeId);
     }
 
     private boolean contains(String digest) {
@@ -80,8 +103,8 @@ final class TrackMixJobs implements AutoCloseable {
                 || waiting.stream().anyMatch(job -> digest.equals(job.digest));
     }
 
-    private void queue(String title, String digest, Kind kind, Work work) {
-        waiting.addLast(new Job(++nextId, title, digest, kind, work));
+    private void queue(String title, String digest, Kind kind, Work work, Consumer<Result> finished) {
+        waiting.addLast(new Job(++nextId, title, digest, kind, work, finished));
         notice = "";
         if (active == null) {
             startNext();
@@ -101,9 +124,11 @@ final class TrackMixJobs implements AutoCloseable {
             job.thread = Thread.currentThread();
         }
         String result = "操作失败";
+        boolean success = false;
         try {
             job.task.check();
             result = job.work.run(job.task);
+            success = true;
         } catch (CancellationException | InterruptedException cancelled) {
             result = "已取消";
         } catch (Exception error) {
@@ -116,21 +141,24 @@ final class TrackMixJobs implements AutoCloseable {
                 job.thread = null;
             }
             Thread.interrupted();
-            finish(job, result);
+            finish(job, new Result(result, success));
         }
     }
 
-    private void finish(Job job, String result) {
+    private void finish(Job job, Result result) {
         try {
             refreshStorage.run();
         } finally {
             synchronized (this) {
-                notice = job.title + " · " + result;
+                notice = job.title + " · " + result.message;
+                noticeId++;
+                noticeStarted = nanoTime.getAsLong();
                 active = null;
                 if (!closed) {
                     startNext();
                 }
             }
+            if (job.finished != null) job.finished.accept(result);
         }
     }
 
@@ -163,17 +191,19 @@ final class TrackMixJobs implements AutoCloseable {
         private final String digest;
         private final Kind kind;
         private final Work work;
+        private final Consumer<Result> finished;
         private volatile Progress progress = new Progress("", 0);
         private Thread thread;
         private final PythonEngine.Task task = new PythonEngine.Task((stage, fraction) ->
                 progress = new Progress(stage, fraction));
 
-        Job(int id, String title, String digest, Kind kind, Work work) {
+        Job(int id, String title, String digest, Kind kind, Work work, Consumer<Result> finished) {
             this.id = id;
             this.title = title;
             this.digest = digest;
             this.kind = kind;
             this.work = work;
+            this.finished = finished;
         }
 
         Item view(boolean running) {

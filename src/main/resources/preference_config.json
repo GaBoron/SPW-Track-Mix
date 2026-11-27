@@ -8,6 +8,18 @@
           "title": "打开六轨调音台",
           "on_click": "dev.gaboron.spwtrackmix.TrackMixPlugin.openMixer",
           "arrow_type": "none"
+        },
+        {
+          "type": "button",
+          "title": "选择缓存目录",
+          "on_click": "dev.gaboron.spwtrackmix.TrackMixPlugin.chooseCacheDirectory",
+          "arrow_type": "none"
+        },
+        {
+          "type": "button",
+          "title": "恢复默认缓存目录",
+          "on_click": "dev.gaboron.spwtrackmix.TrackMixPlugin.resetCacheDirectory",
+          "arrow_type": "none"
         }
       ]
     }

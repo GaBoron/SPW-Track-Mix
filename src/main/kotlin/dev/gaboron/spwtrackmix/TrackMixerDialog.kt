@@ -3,6 +3,7 @@
 package dev.gaboron.spwtrackmix
 
 import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.snap
 import androidx.compose.animation.core.tween
@@ -57,15 +58,16 @@ private val trackNames = listOf("人声", "鼓组", "贝斯", "吉他", "钢琴"
 private val presetNames = listOf("原曲", "纯伴奏", "仅人声", "自定义")
 
 @Composable
-internal fun TrackMixerDialog(session: TrackMixSession, dismiss: () -> Unit) {
+internal fun TrackMixerDialog(session: TrackMixSession, cacheDirectories: CacheDirectoryActions, dismiss: () -> Unit) {
     BasicAdaptiveDialog(dismiss, AdaptiveDialogSize.Max) {
-        TrackMixerContent(session, dismiss)
+        TrackMixerContent(session, cacheDirectories, dismiss)
     }
 }
 
 @Composable
-internal fun TrackMixerContent(session: TrackMixSession, dismiss: () -> Unit) {
+private fun TrackMixerContent(session: TrackMixSession, cacheDirectories: CacheDirectoryActions, dismiss: () -> Unit) {
     var state by remember { mutableStateOf(session.status()) }
+    val openedAfter = remember { state.queue().noticeId() }
     var options by remember { mutableStateOf(session.options()) }
     var manage by remember { mutableStateOf(false) }
     val update = {
@@ -81,7 +83,8 @@ internal fun TrackMixerContent(session: TrackMixSession, dismiss: () -> Unit) {
 
     Column(
         Modifier.fillMaxWidth().clip(SaltTheme.shapes.large).background(SaltTheme.colors.popup)
-            .heightIn(max = 760.dp).verticalScroll(rememberScrollState()).padding(20.dp),
+            .heightIn(max = 760.dp).animateContentSize(tween(180))
+            .verticalScroll(rememberScrollState()).padding(20.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -92,18 +95,18 @@ internal fun TrackMixerContent(session: TrackMixSession, dismiss: () -> Unit) {
                 size = ControlSize.Small)
         }
         if (manage) {
-            ModelAndCache(session, state, options) {
+            ModelAndCache(session, cacheDirectories, state, options) {
                 manage = false
                 update()
             }
         } else {
-            MixerBody(session, state, state.mix(), update) { manage = true }
+            MixerBody(session, state, state.mix(), openedAfter, update) { manage = true }
         }
     }
 }
 
 @Composable
-private fun MixerBody(session: TrackMixSession, state: TrackMixSession.Status, mix: MixSettings,
+private fun MixerBody(session: TrackMixSession, state: TrackMixSession.Status, mix: MixSettings, openedAfter: Int,
                       update: () -> Unit, manage: () -> Unit) {
     val current = state.selection()
     val cached = current?.entry() != null
@@ -137,7 +140,7 @@ private fun MixerBody(session: TrackMixSession, state: TrackMixSession.Status, m
         }
         Button(onClick = manage, text = "模型和缓存", appearance = ButtonAppearance.Subtle, size = ControlSize.Small)
     }
-    SeparationQueue(state.queue()) { id ->
+    SeparationQueue(state.queue(), openedAfter) { id ->
         session.cancel(id)
         update()
     }
@@ -187,7 +190,7 @@ private fun MixerBody(session: TrackMixSession, state: TrackMixSession.Status, m
 }
 
 @Composable
-private fun SeparationQueue(queue: TrackMixJobs.Snapshot, cancel: (Int) -> Unit) {
+private fun SeparationQueue(queue: TrackMixJobs.Snapshot, openedAfter: Int, cancel: (Int) -> Unit) {
     val items = queue.items()
     if (items.isNotEmpty()) {
         Text("后台任务", style = SaltTheme.textStyles.main)
@@ -218,15 +221,16 @@ private fun SeparationQueue(queue: TrackMixJobs.Snapshot, cancel: (Int) -> Unit)
             }
         }
     }
-    if (queue.notice().isNotBlank()) {
-        Text(queue.notice(), style = SaltTheme.textStyles.sub, color = SaltTheme.colors.subText,
+    val notice = queue.noticeAfter(openedAfter)
+    if (notice.isNotBlank()) {
+        Text(notice, style = SaltTheme.textStyles.sub, color = SaltTheme.colors.subText,
             maxLines = 3, overflow = TextOverflow.Ellipsis)
     }
 }
 
 @Composable
-private fun ModelAndCache(session: TrackMixSession, status: TrackMixSession.Status, options: TrackMixOptions,
-                          finished: () -> Unit) {
+private fun ModelAndCache(session: TrackMixSession, cacheDirectories: CacheDirectoryActions,
+                          status: TrackMixSession.Status, options: TrackMixOptions, finished: () -> Unit) {
     var cacheGiB by remember { mutableStateOf(options.cacheGiB()) }
     var quality by remember { mutableStateOf(options.quality()) }
     var fp16 by remember { mutableStateOf(options.fp16()) }
@@ -238,6 +242,13 @@ private fun ModelAndCache(session: TrackMixSession, status: TrackMixSession.Stat
     Text(if (status.modelReady()) "模型已下载" else "首次分离时下载模型",
         color = SaltTheme.colors.subText, style = SaltTheme.textStyles.sub)
     Text("音轨缓存 %.2f GiB".format(status.cacheBytes() / 1073741824.0), style = SaltTheme.textStyles.sub)
+    Text(session.cacheDirectory().toString(), style = SaltTheme.textStyles.sub, color = SaltTheme.colors.subText,
+        maxLines = 2, overflow = TextOverflow.Ellipsis)
+    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Button(onClick = cacheDirectories::choose, text = "选择目录", enabled = idle, size = ControlSize.Small)
+        Button(onClick = cacheDirectories::reset, text = "恢复默认", enabled = idle && options.cacheParent() != null,
+            appearance = ButtonAppearance.Subtle, size = ControlSize.Small)
+    }
 
     RoundedColumn {
         ItemSlider(cacheGiB.toFloat(), { cacheGiB = it.roundToInt() }, "缓存上限", sub = "$cacheGiB GiB",

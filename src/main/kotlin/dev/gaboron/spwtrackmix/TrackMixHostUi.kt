@@ -23,6 +23,7 @@ import java.lang.reflect.Method
 
 /** Exact UI bindings for the same Steam host build as the PCM hook. */
 internal class TrackMixHostUi(private val session: TrackMixSession) : AutoCloseable {
+    val cacheDirectories = CacheDirectoryActions(session)
     private val loader = WorkshopApi::class.java.classLoader
     private val handles = ArrayList<HookHandle>(2)
     private val theme = HostPalette(loader)
@@ -51,7 +52,7 @@ internal class TrackMixHostUi(private val session: TrackMixSession) : AutoClosea
             ) {
                 if (visible && !closed) {
                     theme.Content {
-                        TrackMixerDialog(session) { visible = false }
+                        TrackMixerDialog(session, cacheDirectories) { visible = false }
                     }
                 }
             }
@@ -89,6 +90,7 @@ internal class TrackMixHostUi(private val session: TrackMixSession) : AutoClosea
     override fun close() {
         closed = true
         visible = false
+        cacheDirectories.close()
         var failure: Throwable? = null
         handles.asReversed().forEach { handle ->
             runCatching { handle.close() }.onFailure {

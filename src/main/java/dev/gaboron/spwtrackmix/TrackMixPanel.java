@@ -30,10 +30,12 @@ final class TrackMixPanel implements AmllPlayerRegistration.Panel {
             """;
 
     private final TrackMixSession session;
-    private final Map<String, SettingsDraft> drafts = new HashMap<>();
+    private final CacheDirectoryActions cacheDirectories;
+    private final Map<String, PanelView> views = new HashMap<>();
 
-    TrackMixPanel(TrackMixSession session) {
+    TrackMixPanel(TrackMixSession session, CacheDirectoryActions cacheDirectories) {
         this.session = session;
+        this.cacheDirectories = cacheDirectories;
     }
 
     @Override
@@ -47,7 +49,8 @@ final class TrackMixPanel implements AmllPlayerRegistration.Panel {
         var path = localPath(context.get("path"));
         var track = selectedTrack(status, context.get("trackId"), path);
         var controls = new ArrayList<Map<String, Object>>();
-        var draft = drafts.get(token);
+        var view = views.computeIfAbsent(token, ignored -> new PanelView(status.queue().noticeId()));
+        var draft = view.settings;
         if (draft == null) {
             mixer(controls, status, track, path != null);
         } else if (draft.manageCache) {
@@ -55,7 +58,7 @@ final class TrackMixPanel implements AmllPlayerRegistration.Panel {
         } else {
             settings(controls, draft, status);
         }
-        queue(controls, status.queue());
+        queue(controls, status.queue(), view.openedAfter);
         if (draft == null && track != null && status.ready()) {
             faders(controls, status.mix());
         }
@@ -123,7 +126,7 @@ final class TrackMixPanel implements AmllPlayerRegistration.Panel {
         controls.add(group("column", "faders", 0, 2, lanes));
     }
 
-    private static void queue(List<Map<String, Object>> controls, TrackMixJobs.Snapshot queue) {
+    private static void queue(List<Map<String, Object>> controls, TrackMixJobs.Snapshot queue, int openedAfter) {
         var items = queue.items();
         if (!items.isEmpty()) {
             var rows = new ArrayList<Map<String, Object>>();
@@ -148,13 +151,14 @@ final class TrackMixPanel implements AmllPlayerRegistration.Panel {
             controls.add(node("divider", "queue-divider"));
             controls.add(group("column", "queue", 12, 6, rows));
         }
-        if (!queue.notice().isBlank()) {
-            controls.add(node("text", "job-notice", "text", queue.notice(), "muted", true,
+        String notice = queue.noticeAfter(openedAfter);
+        if (!notice.isBlank()) {
+            controls.add(node("text", "job-notice", "text", notice, "muted", true,
                     "size", 12, "lines", 3, "padding", 12));
         }
     }
 
-    private static void settings(List<Map<String, Object>> controls, SettingsDraft draft, TrackMixSession.Status status) {
+    private void settings(List<Map<String, Object>> controls, SettingsDraft draft, TrackMixSession.Status status) {
         var options = draft.options;
         controls.add(pageHeading("settings", "混音设置", "back", "返回调音台"));
         boolean idle = status.queue().items().isEmpty();
@@ -176,6 +180,11 @@ final class TrackMixPanel implements AmllPlayerRegistration.Panel {
         controls.add(group("column", "model-card", 12, 8, model));
         controls.add(node("divider", "settings-divider"));
         controls.add(group("column", "settings-content", 12, 8, List.of(
+                node("text", "cache-directory", "text", "缓存目录", "emphasis", true),
+                node("text", "cache-path", "text", session.cacheDirectory().toString(), "muted", true, "lines", 2),
+                group("wrap", "directory-actions", 0, 8, List.of(
+                        chip("chooseCacheDirectory", "选择目录", false, idle),
+                        chip("resetCacheDirectory", "恢复默认", false, idle && session.options().cacheParent() != null))),
                 node("text", "cache-limit", "text", "缓存上限", "emphasis", true),
                 node("slider", "limit", "text", "缓存上限", "action", "cacheGiB", "value", options.cacheGiB(),
                         "min", 1, "max", 100, "unit", " GiB", "valueWidth", 62),
@@ -192,18 +201,21 @@ final class TrackMixPanel implements AmllPlayerRegistration.Panel {
         var tracks = catalog == null ? List.<StemCache.CachedTrack>of() : catalog.tracks();
         int lastPage = Math.max(0, (tracks.size() - 1) / CACHE_PAGE_SIZE);
         draft.cachePage = Math.clamp(draft.cachePage, 0, lastPage);
-        controls.add(pageHeading("cache-" + draft.cachePage, "管理缓存", "backFromCache", "返回设置"));
-        if (catalog == null || !catalog.error().isBlank() || tracks.isEmpty()) {
-            String message = catalog == null ? "正在读取缓存" : catalog.error().isBlank() ? "暂无缓存，已占用 0 B" : catalog.error();
-            controls.add(node("text", "cache-empty", "text", message, "muted", true, "padding", 12));
-            return;
-        }
         boolean idle = status.queue().items().isEmpty();
         boolean confirmAll = "".equals(draft.removeDigest);
-        controls.add(group("row", "cache-totals", 12, 6, List.of(
-                node("text", "total", "text", tracks.size() + " 首 · 已占用 " + formatSize(catalog.bytes()),
-                        "muted", true, "fill", true),
-                chip("deleteAll", "清空", false, idle && !confirmAll))));
+        String total = catalog == null ? "正在读取缓存" : !catalog.error().isBlank() ? catalog.error()
+                : tracks.isEmpty() ? "暂无缓存，已占用 0 B" : tracks.size() + " 首 · 已占用 " + formatSize(catalog.bytes());
+        controls.add(node("column", "heading", "scrollKey", "cache-" + draft.cachePage,
+                "padding", 12, "gap", 8, "children", List.of(
+                        group("row", "cache-actions", 0, 8, List.of(
+                                node("text", "title", "text", "管理缓存", "size", 17, "emphasis", true, "fill", true),
+                                chip("backFromCache", "返回设置", false, true),
+                                chip("deleteAll", "清空", false, idle && !confirmAll && !tracks.isEmpty()
+                                        && catalog.error().isBlank()))),
+                        text("total", total, true))));
+        if (catalog == null || !catalog.error().isBlank() || tracks.isEmpty()) {
+            return;
+        }
         if (confirmAll) {
             controls.add(group("column", "clear-all", 12, 4,
                     List.of(confirmation("将全部歌曲的音轨缓存移入回收站？", "confirmCache", "cancelCache", idle))));
@@ -260,7 +272,8 @@ final class TrackMixPanel implements AmllPlayerRegistration.Panel {
     public synchronized void action(String token, Map<String, String> context, String action, int value) {
         var status = session.status();
         var track = selectedTrack(status, context.get("trackId"), localPath(context.get("path")));
-        var draft = drafts.get(token);
+        var view = views.computeIfAbsent(token, ignored -> new PanelView(status.queue().noticeId()));
+        var draft = view.settings;
         if (action.startsWith("cancel.")) {
             int id = suffix(action);
             if (id > 0) session.cancel(id);
@@ -270,12 +283,12 @@ final class TrackMixPanel implements AmllPlayerRegistration.Panel {
             if (draft.manageCache) {
                 editCache(draft, status, action);
             } else {
-                editSettings(token, draft, status, action, value);
+                editSettings(view, draft, status, action, value);
             }
             return;
         }
         if (action.equals("settings")) {
-            drafts.put(token, new SettingsDraft(session.options()));
+            view.settings = new SettingsDraft(session.options());
             return;
         }
         if (track == null) return;
@@ -306,15 +319,17 @@ final class TrackMixPanel implements AmllPlayerRegistration.Panel {
         }
     }
 
-    private void editSettings(String token, SettingsDraft draft, TrackMixSession.Status status, String action, int value) {
+    private void editSettings(PanelView view, SettingsDraft draft, TrackMixSession.Status status, String action, int value) {
         var current = draft.options;
         boolean idle = status.queue().items().isEmpty();
         switch (action) {
-            case "back" -> drafts.remove(token);
+            case "back" -> view.settings = null;
             case "save" -> {
                 session.setOptions(current.cacheGiB(), current.quality(), current.cpu(), current.fp16());
-                drafts.remove(token);
+                view.settings = null;
             }
+            case "chooseCacheDirectory" -> { if (idle) cacheDirectories.choose(); }
+            case "resetCacheDirectory" -> { if (idle) cacheDirectories.reset(); }
             case "cacheGiB" -> draft.options = new TrackMixOptions(Math.clamp(value, 1, 100),
                     current.quality(), current.cpu(), current.fp16());
             case "quality" -> draft.options = new TrackMixOptions(current.cacheGiB(),
@@ -385,7 +400,7 @@ final class TrackMixPanel implements AmllPlayerRegistration.Panel {
 
     @Override
     public synchronized void close(String token) {
-        drafts.remove(token);
+        views.remove(token);
     }
 
     private static TrackMixSession.Selection selectedTrack(TrackMixSession.Status status, String id, Path path) {
@@ -447,6 +462,15 @@ final class TrackMixPanel implements AmllPlayerRegistration.Panel {
             return icon == null ? "" : new String(icon.readAllBytes(), StandardCharsets.UTF_8);
         } catch (IOException error) {
             throw new UncheckedIOException(error);
+        }
+    }
+
+    private static final class PanelView {
+        private final int openedAfter;
+        private SettingsDraft settings;
+
+        PanelView(int openedAfter) {
+            this.openedAfter = openedAfter;
         }
     }
 

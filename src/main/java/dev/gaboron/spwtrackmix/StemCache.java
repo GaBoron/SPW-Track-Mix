@@ -6,6 +6,7 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
+import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
@@ -20,26 +21,19 @@ import java.util.HashMap;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Properties;
-import java.util.regex.Pattern;
-import java.util.zip.CRC32C;
+import java.util.Set;
 
 final class StemCache implements AutoCloseable {
     static final int FLOATS_PER_FRAME = MixSettings.STEMS * 2;
     static final int BYTES_PER_FRAME = FLOATS_PER_FRAME * Float.BYTES;
     static final int MAX_WINDOW_FRAMES = 192_000;
     private static final int MAGIC = 0x58494d54;
-    private static final int LEGACY_VERSION = 1;
-    private static final int VERSION = 2;
-    private static final int BASE_HEADER_BYTES = 48;
-    private static final int LEGACY_HEADER_BYTES = BASE_HEADER_BYTES + LoudnessProfile.BYTES;
     private static final int JEMA_METADATA_VERSION = 1;
     private static final int JEMA_METADATA_BYTES = 2 * Integer.BYTES + MixSettings.STEMS * Float.BYTES
             + LoudnessProfile.BYTES;
     private static final int CHUNK_BYTES = BYTES_PER_FRAME * 16384;
-    private static final String MODEL = "a443a298-";
-    private static final Pattern CACHE_NAME = Pattern.compile("[a-f0-9]{8}-(quick-)?([a-f0-9]{64})\\.(?:jema|stems)");
     private static final System.Logger LOG = System.getLogger(StemCache.class.getName());
-    private final Path root;
+    private volatile Path root;
     private final Recycler recycler;
     private final JemaCodec jema;
 
@@ -49,9 +43,21 @@ final class StemCache implements AutoCloseable {
     }
 
     StemCache(Path root, Recycler recycler) {
+        this(root, root.toAbsolutePath().normalize().resolveSibling("codec"), recycler);
+    }
+
+    StemCache(Path root, Path codecDirectory, Recycler recycler) {
         this.root = root.toAbsolutePath().normalize();
         this.recycler = recycler;
-        this.jema = new JemaCodec(this.root.resolveSibling("codec"));
+        this.jema = new JemaCodec(codecDirectory);
+    }
+
+    Path root() {
+        return root;
+    }
+
+    synchronized void changeRoot(Path directory) {
+        root = directory.toAbsolutePath().normalize();
     }
 
     record Identity(Path path, Object fileKey, long length, FileTime modified, String digest) {
@@ -84,8 +90,7 @@ final class StemCache implements AutoCloseable {
         }
     }
 
-    record Entry(Path path, int rate, int frames, float[] peaks, int legacyHeaderBytes,
-                 LoudnessProfile loudness, boolean quick) {
+    record Entry(Path path, int rate, int frames, float[] peaks, LoudnessProfile loudness, boolean quick) {
         Entry {
             peaks = peaks.clone();
         }
@@ -117,15 +122,21 @@ final class StemCache implements AutoCloseable {
     }
 
     synchronized Entry lookup(Identity id) throws IOException {
+        return lookup(id, "");
+    }
+
+    synchronized Entry lookup(Identity id, String title) throws IOException {
         IOException failure = null;
-        // Keep the best separation quality, preferring JEMA within each quality.
-        for (Path path : List.of(entryPath(id, false, ".jema"), entryPath(id, false, ".stems"),
-                entryPath(id, true, ".jema"), entryPath(id, true, ".stems"))) {
-            if (!Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)) {
-                continue;
-            }
+        // Prefer the standard result and use the most recent file if duplicates exist.
+        var candidates = entries().stream().filter(path -> {
+            var name = CacheFileName.parse(path);
+            return name.model().equals(CacheFileName.CURRENT_MODEL) && name.digest().equals(id.digest);
+        }).sorted(Comparator.comparing((Path path) -> CacheFileName.parse(path).quick())
+                .thenComparing(StemCache::lastUsed, Comparator.reverseOrder())).toList();
+        for (Path candidate : candidates) {
             try {
-                Entry entry = path.toString().endsWith(".jema") ? readJema(path) : verifyLegacy(path);
+                Path path = nameCacheFile(candidate, title);
+                Entry entry = readJema(path);
                 Files.setLastModifiedTime(path, FileTime.from(Instant.now()));
                 return entry;
             } catch (IOException error) {
@@ -139,20 +150,27 @@ final class StemCache implements AutoCloseable {
 
     Entry publish(Identity id, int rate, int frames, Path raw, Path original, Path staging, long limit, boolean quick)
             throws IOException {
+        return publish(id, "", rate, frames, raw, original, staging, limit, quick);
+    }
+
+    Entry publish(Identity id, String title, int rate, int frames, Path raw, Path original, Path staging, long limit,
+                  boolean quick) throws IOException {
         long dataBytes = (long) frames * BYTES_PER_FRAME;
         if (frames <= 0 || rate < 8000 || rate > 384000 || Files.size(raw) != dataBytes || (original != null
                 && Files.size(original) != (long) frames * AudioFormat.FLOAT_FRAME_BYTES) || !id.current()) {
             throw new IOException("分离输出不完整或音频文件已变更");
         }
-        Files.createDirectories(root);
-        Path target = entryPath(id, quick, ".jema");
+        if (!id.digest.matches("[a-f0-9]{64}")) throw new IllegalArgumentException("Invalid source identity");
+        var name = new CacheFileName(null, CacheFileName.CURRENT_MODEL, quick, id.digest);
+        Path target = root.resolve(name.forTitle(title));
+        Files.createDirectories(target.getParent());
         Path pending = staging.resolve("completed.jema");
         ByteBuffer metadata = ordered(JEMA_METADATA_BYTES);
         try (var input = FileChannel.open(raw, StandardOpenOption.READ);
              var reference = original == null ? null : FileChannel.open(original, StandardOpenOption.READ)) {
             var peaks = new float[MixSettings.STEMS];
             var analysis = new LoudnessProfile.Analysis(rate);
-            scan(input, dataBytes, null, peaks, analysis, reference);
+            scan(input, dataBytes, peaks, analysis, reference);
             metadata.putInt(MAGIC).putInt(JEMA_METADATA_VERSION);
             for (float peak : peaks) {
                 metadata.putFloat(peak);
@@ -171,34 +189,33 @@ final class StemCache implements AutoCloseable {
 
         synchronized (this) {
             checkInterrupted();
+            if (!root.equals(target.getParent())) {
+                throw new IOException("缓存目录已变更");
+            }
             if (!id.current()) {
                 throw new IOException("音频文件已变更");
             }
-            evict(limit - bytes, target);
-            if (Files.exists(target, LinkOption.NOFOLLOW_LINKS)) {
-                recycle(target);
+            var replaced = new java.util.HashSet<Path>();
+            for (Path file : entries()) {
+                var existing = CacheFileName.parse(file);
+                if (existing.key().equals(name.key())) replaced.add(file);
             }
+            if (Files.exists(target, LinkOption.NOFOLLOW_LINKS) && !replaced.contains(target)) {
+                throw new IOException("缓存文件名已被占用");
+            }
+            evictExcept(limit - bytes, replaced);
+            for (Path file : replaced) recycle(file);
             Files.move(pending, target, StandardCopyOption.ATOMIC_MOVE);
         }
-        return new Entry(target, rate, frames, encoded.peaks, 0, encoded.loudness, quick);
+        return new Entry(target, rate, frames, encoded.peaks, encoded.loudness, quick);
     }
 
     Window readWindow(Entry entry, int start, int frames) throws IOException {
         if (start < 0 || frames <= 0 || frames > MAX_WINDOW_FRAMES || frames > entry.frames - start) {
             throw new IOException("音轨缓存帧范围无效");
         }
-        ByteBuffer data;
-        if (entry.legacyHeaderBytes == 0) {
-            data = ByteBuffer.wrap(jema.readFrames(entry.path, entry.rate, entry.frames, start, frames))
-                    .order(ByteOrder.LITTLE_ENDIAN);
-        } else {
-            data = ordered(Math.multiplyExact(frames, BYTES_PER_FRAME));
-            try (var file = FileChannel.open(entry.path, StandardOpenOption.READ)) {
-                file.position(entry.legacyHeaderBytes + (long) start * BYTES_PER_FRAME);
-                read(file, data);
-            }
-            data.flip();
-        }
+        var data = ByteBuffer.wrap(jema.readFrames(entry.path, entry.rate, entry.frames, start, frames))
+                .order(ByteOrder.LITTLE_ENDIAN);
         var samples = new float[frames * FLOATS_PER_FRAME];
         data.asFloatBuffer().get(samples);
         for (float sample : samples) {
@@ -220,32 +237,38 @@ final class StemCache implements AutoCloseable {
     synchronized List<CachedTrack> catalog(String namedDigest, String title) throws IOException {
         var groups = new HashMap<String, CachedTrack>();
         for (Path file : entries()) {
-            var name = CACHE_NAME.matcher(file.getFileName().toString());
-            if (!name.matches()) continue;
+            var name = CacheFileName.parse(file);
             var info = Files.readAttributes(file, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
-            String digest = name.group(2);
-            boolean quick = name.group(1) != null;
-            groups.merge(digest, new CachedTrack(digest, "", info.size(), info.lastModifiedTime(), quick, !quick),
-                    (first, second) -> new CachedTrack(digest, "", first.bytes + second.bytes,
+            String digest = name.digest();
+            boolean quick = name.quick();
+            groups.merge(digest, new CachedTrack(digest, name.title(), info.size(), info.lastModifiedTime(), quick, !quick),
+                    (first, second) -> new CachedTrack(digest, first.title.isBlank() ? second.title : first.title,
+                            first.bytes + second.bytes,
                             first.lastUsed.compareTo(second.lastUsed) >= 0 ? first.lastUsed : second.lastUsed,
                             first.quick || second.quick, first.standard || second.standard));
         }
-        var titles = readTitles();
+        var titles = readTitles(root);
         var updated = new Properties();
         updated.putAll(titles);
         updated.keySet().retainAll(groups.keySet());
         if (namedDigest != null && groups.containsKey(namedDigest) && !title.isBlank()) {
             updated.setProperty(namedDigest, title);
         }
-        if (!titles.equals(updated)) writeTitles(updated);
+        if (!titles.equals(updated)) {
+            try {
+                writeTitles(root, updated);
+            } catch (IOException error) {
+                LOG.log(System.Logger.Level.WARNING, "Could not save cache titles", error);
+            }
+        }
         return groups.values().stream()
                 .sorted(Comparator.comparing(CachedTrack::lastUsed).reversed().thenComparing(CachedTrack::digest))
-                .map(track -> new CachedTrack(track.digest, updated.getProperty(track.digest, ""), track.bytes,
+                .map(track -> new CachedTrack(track.digest, updated.getProperty(track.digest, track.title), track.bytes,
                         track.lastUsed, track.quick, track.standard))
                 .toList();
     }
 
-    private Properties readTitles() {
+    static Properties readTitles(Path root) {
         var titles = new Properties();
         Path index = root.resolve("titles.properties");
         if (Files.isRegularFile(index, LinkOption.NOFOLLOW_LINKS)) {
@@ -258,18 +281,14 @@ final class StemCache implements AutoCloseable {
         return titles;
     }
 
-    private void writeTitles(Properties titles) {
+    static void writeTitles(Path root, Properties titles) throws IOException {
         Path pending = root.resolve("titles.pending");
-        try {
-            try (var output = Files.newOutputStream(pending, StandardOpenOption.CREATE,
-                    StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE, LinkOption.NOFOLLOW_LINKS)) {
-                titles.store(output, null);
-            }
-            Files.move(pending, root.resolve("titles.properties"),
-                    StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
-        } catch (IOException error) {
-            LOG.log(System.Logger.Level.WARNING, "Could not save cache titles", error);
+        try (var output = Files.newOutputStream(pending, StandardOpenOption.CREATE,
+                StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE, LinkOption.NOFOLLOW_LINKS)) {
+            titles.store(output, null);
         }
+        Files.move(pending, root.resolve("titles.properties"),
+                StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
     }
 
     synchronized void clear(String digest) throws IOException {
@@ -277,14 +296,17 @@ final class StemCache implements AutoCloseable {
             throw new IllegalArgumentException("Invalid source identity");
         }
         for (Path file : entries()) {
-            String name = file.getFileName().toString();
-            if (name.endsWith(digest + ".jema") || name.endsWith(digest + ".stems")) recycle(file);
+            if (digest.isEmpty() || digest.equals(CacheFileName.parse(file).digest())) recycle(file);
         }
     }
 
     synchronized void evict(long limit, Path keep) throws IOException {
+        evictExcept(limit, keep == null ? Set.of() : Set.of(keep));
+    }
+
+    private void evictExcept(long limit, Set<Path> keep) throws IOException {
         List<Path> files = entries().stream()
-                .filter(path -> !path.equals(keep))
+                .filter(path -> !keep.contains(path))
                 .sorted(Comparator.comparing(StemCache::lastUsed))
                 .toList();
         long total = 0;
@@ -316,56 +338,15 @@ final class StemCache implements AutoCloseable {
             }
             peaks[track] = peak;
         }
-        return new Entry(path, info.rate(), info.frames(), peaks, 0, LoudnessProfile.read(metadata), isQuick(path));
-    }
-
-    private Entry verifyLegacy(Path path) throws IOException {
-        try (var input = FileChannel.open(path, StandardOpenOption.READ)) {
-            var header = ordered(BASE_HEADER_BYTES);
-            read(input, header);
-            header.flip();
-            int magic = header.getInt();
-            int version = header.getInt();
-            if (magic != MAGIC || (version != LEGACY_VERSION && version != VERSION)) {
-                throw new IOException("音轨缓存版本不匹配");
-            }
-            int rate = header.getInt();
-            int frames = header.getInt();
-            long checksum = header.getLong();
-            var peaks = new float[MixSettings.STEMS];
-            for (int track = 0; track < peaks.length; track++) {
-                peaks[track] = header.getFloat();
-            }
-            long dataBytes = (long) frames * BYTES_PER_FRAME;
-            int headerBytes = version == VERSION ? LEGACY_HEADER_BYTES : BASE_HEADER_BYTES;
-            if (rate < 8000 || rate > 384000 || frames <= 0 || input.size() != headerBytes + dataBytes) {
-                throw new IOException("音轨缓存长度或格式无效");
-            }
-            var actual = new CRC32C();
-            var actualPeaks = new float[MixSettings.STEMS];
-            LoudnessProfile profile = null;
-            if (version == VERSION) {
-                var metadata = ordered(LoudnessProfile.BYTES);
-                read(input, metadata);
-                metadata.flip();
-                profile = LoudnessProfile.read(metadata);
-            }
-            // Version 1 never stored the source reference, so estimate it from the six stems.
-            var analysis = profile == null ? new LoudnessProfile.Analysis(rate) : null;
-            scan(input, dataBytes, actual, actualPeaks, analysis, null);
-            if (actual.getValue() != checksum || !java.util.Arrays.equals(peaks, actualPeaks)) {
-                throw new IOException("音轨缓存完整性检查失败");
-            }
-            return new Entry(path, rate, frames, peaks, headerBytes,
-                    profile == null ? analysis.result() : profile, isQuick(path));
-        }
+        return new Entry(path, info.rate(), info.frames(), peaks, LoudnessProfile.read(metadata), isQuick(path));
     }
 
     private static boolean isQuick(Path path) {
-        return path.getFileName().toString().startsWith(MODEL + "quick-");
+        var name = CacheFileName.parse(path);
+        return name != null && name.quick();
     }
 
-    private static void scan(FileChannel input, long remaining, CRC32C crc, float[] peaks,
+    private static void scan(FileChannel input, long remaining, float[] peaks,
                              LoudnessProfile.Analysis analysis, FileChannel original) throws IOException {
         var chunk = ordered(CHUNK_BYTES);
         var source = original == null ? null : ordered(CHUNK_BYTES / FLOATS_PER_FRAME * 2);
@@ -375,7 +356,6 @@ final class StemCache implements AutoCloseable {
             chunk.clear().limit(size);
             read(input, chunk);
             chunk.flip();
-            if (crc != null) crc.update(chunk.array(), 0, size);
             if (source != null) {
                 source.clear().limit(size / FLOATS_PER_FRAME * 2);
                 read(original, source);
@@ -390,15 +370,17 @@ final class StemCache implements AutoCloseable {
                     }
                     peaks[stem] = Math.max(peaks[stem], max);
                 }
-                if (analysis != null) {
-                    analysis.accept(chunk, offset, source, offset / FLOATS_PER_FRAME * 2);
-                }
+                analysis.accept(chunk, offset, source, offset / FLOATS_PER_FRAME * 2);
             }
             remaining -= size;
         }
     }
 
     private List<Path> entries() throws IOException {
+        return filesIn(root);
+    }
+
+    static List<Path> filesIn(Path root) throws IOException {
         if (!Files.isDirectory(root)) {
             return List.of();
         }
@@ -408,15 +390,28 @@ final class StemCache implements AutoCloseable {
     }
 
     private static boolean isCacheFile(Path path) {
-        return CACHE_NAME.matcher(path.getFileName().toString()).matches()
+        return CacheFileName.parse(path) != null
                 && Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS);
     }
 
-    private Path entryPath(Identity id, boolean quick, String extension) {
-        if (!id.digest.matches("[a-f0-9]{64}")) {
-            throw new IllegalArgumentException("Invalid source identity");
+    static void renameKnownFiles(Path root) throws IOException {
+        var titles = readTitles(root);
+        for (Path file : filesIn(root)) {
+            nameCacheFile(file, titles.getProperty(CacheFileName.parse(file).digest(), ""));
         }
-        return root.resolve(MODEL + (quick ? "quick-" : "") + id.digest + extension);
+    }
+
+    private static Path nameCacheFile(Path file, String title) {
+        var name = CacheFileName.parse(file);
+        if (title.isBlank() || name.prefix() != null) return file;
+        try {
+            return Files.move(file, file.resolveSibling(name.forTitle(title)));
+        } catch (FileAlreadyExistsException ignored) {
+            return file;
+        } catch (IOException error) {
+            LOG.log(System.Logger.Level.WARNING, "Could not rename cache " + file, error);
+            return file;
+        }
     }
 
     private void recycle(Path file) throws IOException {

@@ -24,10 +24,14 @@ public final class TrackMixLink implements AutoCloseable {
     }
 
     TrackMixLink(TrackMixSession session) {
+        this(session, new CacheDirectoryActions(session));
+    }
+
+    TrackMixLink(TrackMixSession session, CacheDirectoryActions cacheDirectories) {
         try {
             server.registerMBean(new StandardMBean(new Controls(session), Mixer.class, false), MIXER);
             try {
-                extensions = new AmllPlayerRegistration(server, session);
+                extensions = new AmllPlayerRegistration(server, session, cacheDirectories);
             } catch (JMException | RuntimeException error) {
                 try {
                     server.unregisterMBean(MIXER);

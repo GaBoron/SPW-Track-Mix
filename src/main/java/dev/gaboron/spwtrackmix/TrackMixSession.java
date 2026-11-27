@@ -2,6 +2,7 @@ package dev.gaboron.spwtrackmix;
 
 import java.io.IOException;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.concurrent.Executors;
@@ -9,6 +10,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Consumer;
 import java.util.function.Supplier;
 import java.util.function.UnaryOperator;
 
@@ -53,6 +55,7 @@ final class TrackMixSession implements AutoCloseable {
 
     private final Path data;
     private final Path config;
+    private final Path defaultCacheDirectory;
     private final Supplier<Track> currentTrack;
     private final PlaybackSource playbackSource;
     private final StemCache cache;
@@ -89,15 +92,17 @@ final class TrackMixSession implements AutoCloseable {
         this.currentTrack = currentTrack;
         this.playbackSource = playbackSource;
         config = data.resolve("settings.properties");
+        defaultCacheDirectory = data.resolve("cache").toAbsolutePath().normalize();
         options = saved = TrackMixOptions.read(config);
-        cache = new StemCache(data.resolve("cache"), WindowsRecycle::recycle);
+        cache = new StemCache(options.cacheDirectory(defaultCacheDirectory),
+                data.resolve("codec").toAbsolutePath().normalize(), WindowsRecycle::recycle);
         engine = new PythonEngine(data);
     }
 
     void start() {
         monitor.scheduleWithFixedDelay(this::poll, 0, 650, TimeUnit.MILLISECONDS);
         preloader.scheduleWithFixedDelay(this::prefetch, 0, 30, TimeUnit.MILLISECONDS);
-        worker.execute(this::enforceLimit);
+        worker.execute(this::initializeCache);
     }
 
     void sourceOpened(int channel, String path) {
@@ -164,6 +169,60 @@ final class TrackMixSession implements AutoCloseable {
         return options;
     }
 
+    Path cacheDirectory() {
+        return cache.root();
+    }
+
+    boolean changeCacheDirectory(Path folder, Consumer<TrackMixJobs.Result> finished) {
+        return jobs.maintain("缓存目录", task -> {
+            task.report("cache-directory", 0);
+            return migrateCacheDirectory(folder, task);
+        }, finished);
+    }
+
+    private String migrateCacheDirectory(Path folder, PythonEngine.Task task) throws IOException {
+        Path parent = folder == null ? null : folder.toRealPath();
+        if (parent != null && Files.isDirectory(defaultCacheDirectory)
+                && parent.equals(defaultCacheDirectory.toRealPath())) {
+            parent = null;
+        } else if (parent != null && parent.getFileName() != null
+                && TrackMixOptions.CACHE_FOLDER.equalsIgnoreCase(parent.getFileName().toString())) {
+            parent = parent.getParent();
+        }
+        Path currentDirectory = cache.root();
+        if (java.util.Objects.equals(options.cacheParent(), parent)) {
+            return "当前已使用此缓存目录";
+        }
+        Path directory = options.withCacheParent(parent).cacheDirectory(defaultCacheDirectory);
+        Files.createDirectories(directory);
+        if (!Files.isDirectory(directory, LinkOption.NOFOLLOW_LINKS)
+                || (parent != null && !directory.equals(directory.toRealPath()))
+                || !Files.isWritable(directory)) {
+            throw new IOException("缓存目录不可写");
+        }
+        var migration = CacheDirectoryMigration.prepare(currentDirectory, directory, task);
+        StemCache.renameKnownFiles(directory);
+        synchronized (configurationLock) {
+            task.check();
+            var updated = options.withCacheParent(parent);
+            updated.write(config);
+            // No job can publish to the old directory during this maintenance task.
+            // Invalidate monitor lookups and DSP windows together before reading the new directory.
+            synchronized (preloadLock) {
+                synchronized (playbackLock) {
+                    cache.changeRoot(directory);
+                    cacheRevision.incrementAndGet();
+                    bypassCurrent("");
+                    catalog = null;
+                    options = saved = updated;
+                }
+            }
+        }
+        int retained = migration.recycleOriginals();
+        String result = parent == null ? "已恢复默认缓存目录" : "已更新缓存目录";
+        return retained == 0 ? result : result + "，原目录保留 " + retained + " 个缓存文件";
+    }
+
     void setMix(UnaryOperator<MixSettings> change) {
         setMix(null, change);
     }
@@ -191,7 +250,7 @@ final class TrackMixSession implements AutoCloseable {
         boolean changedLimit;
         synchronized (configurationLock) {
             changedLimit = options.cacheGiB() != limit;
-            options = new TrackMixOptions(limit, quality, cpu, fp16);
+            options = new TrackMixOptions(limit, quality, cpu, fp16, options.cacheParent());
         }
         if (changedLimit) {
             worker.execute(this::enforceLimit);
@@ -261,7 +320,8 @@ final class TrackMixSession implements AutoCloseable {
 
     private String separateTrack(Selection selected, TrackMixOptions parameters, boolean quick, PythonEngine.Task task)
             throws IOException, InterruptedException {
-        Path stagingParent = data.resolve("jobs");
+        // Staging and cache publication must be on the same volume for the final atomic move.
+        Path stagingParent = cache.root().resolve("jobs");
         Files.createDirectories(stagingParent);
         Path staging = Files.createTempDirectory(stagingParent, "separate-");
         try {
@@ -279,7 +339,7 @@ final class TrackMixSession implements AutoCloseable {
             task.report("cache", 0);
             StemCache.Entry entry;
             try {
-                entry = cache.publish(selected.identity, format.rate(), format.frames(), output, input, staging,
+                entry = cache.publish(selected.identity, selected.track.title, format.rate(), format.frames(), output, input, staging,
                         options.cacheBytes(), quick);
             } catch (IOException error) {
                 cacheRevision.incrementAndGet();
@@ -380,12 +440,12 @@ final class TrackMixSession implements AutoCloseable {
             if (removes(identity, removingDigest)) return;
             Selection result;
             try {
-                result = new Selection(track, identity, cache.lookup(identity), "");
+                result = new Selection(track, identity, cache.lookup(identity, track.title), "");
             } catch (IOException error) {
                 result = new Selection(track, identity, null, display(error));
             }
             if (publishCacheSelection(selected, result, revision)) {
-                rememberLegacyTitle(identity.digest(), track.title);
+                rememberCacheTitle(identity.digest(), track.title);
             }
         } catch (Exception error) {
             if (selected != null) {
@@ -442,6 +502,20 @@ final class TrackMixSession implements AutoCloseable {
         }
     }
 
+    private void initializeCache() {
+        try {
+            synchronized (preloadLock) {
+                synchronized (playbackLock) {
+                    StemCache.renameKnownFiles(cache.root());
+                    cacheRevision.incrementAndGet();
+                }
+            }
+        } catch (IOException error) {
+            LOG.log(System.Logger.Level.WARNING, "Could not prepare readable cache names", error);
+        }
+        enforceLimit();
+    }
+
     private void bypassCurrent(String digest) {
         synchronized (preloadLock) {
             synchronized (playbackLock) {
@@ -482,7 +556,7 @@ final class TrackMixSession implements AutoCloseable {
         }
     }
 
-    private void rememberLegacyTitle(String digest, String title) {
+    private void rememberCacheTitle(String digest, String title) {
         if (title.isBlank() || !needsTitle(catalog, digest)) return;
         worker.execute(() -> {
             if (needsTitle(catalog, digest)) refreshCatalog(digest, title);

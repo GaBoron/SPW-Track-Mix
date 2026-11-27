@@ -27,9 +27,10 @@ public final class AmllPlayerRegistration implements AutoCloseable {
     private final ObjectName panel = ObjectName.getInstance(DOMAIN + "type=PlayerPanel" + PROVIDER);
     private final ObjectName spectrum = ObjectName.getInstance(DOMAIN + "type=SpectrumSource" + PROVIDER);
 
-    AmllPlayerRegistration(MBeanServer server, TrackMixSession session) throws JMException {
+    AmllPlayerRegistration(MBeanServer server, TrackMixSession session, CacheDirectoryActions cacheDirectories)
+            throws JMException {
         this.server = server;
-        server.registerMBean(new StandardMBean(new TrackMixPanel(session), Panel.class), panel);
+        server.registerMBean(new StandardMBean(new TrackMixPanel(session, cacheDirectories), Panel.class), panel);
         try {
             SpectrumSource reader = session::spectrum;
             server.registerMBean(new StandardMBean(reader, SpectrumSource.class), spectrum);

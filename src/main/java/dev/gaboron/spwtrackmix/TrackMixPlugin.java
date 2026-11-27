@@ -40,6 +40,18 @@ public final class TrackMixPlugin extends SpwPlugin {
         }
     }
 
+    public static void chooseCacheDirectory() {
+        var active = mixerWindow;
+        if (active != null) active.getCacheDirectories().choose();
+        else WorkshopApi.ui().toast("请先启用 SPW Track Mix", WorkshopApi.Ui.ToastType.Warning);
+    }
+
+    public static void resetCacheDirectory() {
+        var active = mixerWindow;
+        if (active != null) active.getCacheDirectories().reset();
+        else WorkshopApi.ui().toast("请先启用 SPW Track Mix", WorkshopApi.Ui.ToastType.Warning);
+    }
+
     @Override
     public synchronized void start() {
         var context = getPluginContext();
@@ -79,7 +91,7 @@ public final class TrackMixPlugin extends SpwPlugin {
             window = new TrackMixHostUi(created);
             window.install();
             created.start();
-            link = new TrackMixLink(created);
+            link = new TrackMixLink(created, window.getCacheDirectories());
             session = created;
             mixerWindow = window;
         } catch (RuntimeException | Error error) {

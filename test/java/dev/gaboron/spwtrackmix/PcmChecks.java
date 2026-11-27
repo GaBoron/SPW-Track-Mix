@@ -6,6 +6,7 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.file.FileSystems;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayDeque;
@@ -16,8 +17,9 @@ import java.util.Properties;
 import javax.management.ObjectName;
 import java.lang.management.ManagementFactory;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.zip.CRC32C;
 
 final class PcmChecks {
     private static final ValueLayout.OfFloat FLOAT = ValueLayout.JAVA_FLOAT_UNALIGNED;
@@ -35,7 +37,7 @@ final class PcmChecks {
                 }
             }
             var entry = new StemCache.Entry(Path.of("fixture"), 44100, FRAMES,
-                    new float[]{0.05f, 0.10f, 0.15f, 0.20f, 0.25f, 0.30f}, 0, null, false);
+                    new float[]{0.05f, 0.10f, 0.15f, 0.20f, 0.25f, 0.30f}, null, false);
             var window = new StemCache.Window(entry, 0, samples);
             var buffer = arena.allocate(500 * AudioFormat.FLOAT_FRAME_BYTES);
             var mixer = new RealtimeStemMixer(44100);
@@ -74,6 +76,7 @@ final class PcmChecks {
         loudnessChecks();
         spectrumChecks();
         cacheChecks();
+        cacheMigrationChecks();
         playbackSessionChecks();
         queueChecks();
         System.out.println("Mixer, loudness, cached PCM, source-positioned FFT per-track resets, and queued separation verified.");
@@ -219,33 +222,17 @@ final class PcmChecks {
             require(cache.readWindow(entry, cacheFrames - 12, 12).end() == cacheFrames,
                     "the partial final JEMA block could not be read");
 
-            var crc = new CRC32C();
-            crc.update(data.array());
-            var legacy = ByteBuffer.allocate(48 + data.capacity()).order(ByteOrder.LITTLE_ENDIAN);
-            legacy.putInt(0x58494d54).putInt(1).putInt(48000).putInt(cacheFrames).putLong(crc.getValue());
-            for (int track = 0; track < MixSettings.STEMS; track++) legacy.putFloat(.125f);
-            legacy.put(data.array());
             Path oldPath = Files.write(entry.path().resolveSibling("a443a298-" + identity.digest() + ".stems"),
-                    legacy.array());
-            require(cache.lookup(identity).path().equals(entry.path()), "JEMA should take priority over same-quality legacy");
-
+                    new byte[] {1, 2, 3});
             var bytes = Files.readAllBytes(entry.path());
             bytes[bytes.length - 1] ^= 1;
             Files.write(entry.path(), bytes);
-            var oldCache = cache.lookup(identity);
-            require(oldCache.path().equals(oldPath), "legacy cache fallback was not accepted");
-            near(oldCache.loudness().gainFor(MixSettings.DEFAULT.withPreset(MixSettings.Preset.VOCALS)), 6,
-                    "legacy loudness estimated from all stems");
-            near(cache.readWindow(oldCache, 102, 100).samples()[1199], -.125f, "legacy PCM offset");
-            var versionTwo = ByteBuffer.allocate(legacy.capacity() + LoudnessProfile.BYTES).order(ByteOrder.LITTLE_ENDIAN);
-            versionTwo.put(legacy.array(), 0, 48).putInt(4, 2);
-            entry.loudness().write(versionTwo);
-            versionTwo.put(data.array());
-            Files.write(oldPath, versionTwo.array());
-            var previous = cache.lookup(identity);
-            require(previous.path().equals(oldPath) && previous.legacyHeaderBytes() == 48 + LoudnessProfile.BYTES,
-                    "the previous cache's persisted loudness metadata could not be read");
-            near(cache.readWindow(previous, 102, 100).samples()[1199], -.125f, "version 2 PCM offset");
+            try {
+                cache.lookup(identity);
+                throw new AssertionError("corrupt JEMA metadata was accepted");
+            } catch (IOException expected) {
+                require(expected.getMessage() != null, "corruption reason missing");
+            }
             bytes[bytes.length - 1] ^= 1;
             Files.write(entry.path(), bytes);
             long size = Files.size(entry.path());
@@ -259,7 +246,8 @@ final class PcmChecks {
                         && cache.lookup(otherIdentity) == null, "failed publishing evicted valid caches");
             }
             var second = cache.publish(otherIdentity, 48000, cacheFrames, raw, null, directory, size, false);
-            require(cache.size() == size && cache.lookup(identity) == null, "old cache not evicted");
+            require(cache.size() == size && cache.lookup(identity) == null && Files.isRegularFile(oldPath),
+                    "eviction did not drop the older JEMA while leaving unsupported files alone");
             bytes = Files.readAllBytes(second.path());
             // The revision 1 header and six channel-count fields occupy the first 60 bytes.
             bytes[60] ^= 1;
@@ -281,6 +269,74 @@ final class PcmChecks {
         }
     }
 
+    private static void cacheMigrationChecks() throws Exception {
+        Path work = Files.createTempDirectory("spw-track-mix-migration-check-").toRealPath();
+        try {
+            Path data = Files.createDirectory(work.resolve("app"));
+            Path defaultCache = Files.createDirectory(data.resolve("cache"));
+            Path choice = Files.createDirectory(work.resolve("新缓存"));
+            Path destination = Files.createDirectory(choice.resolve(TrackMixOptions.CACHE_FOLDER));
+            var identity = StemCache.Identity.read(Files.writeString(work.resolve("song"), "song source"));
+            int frames = 37;
+            var samples = ByteBuffer.allocate(frames * StemCache.BYTES_PER_FRAME).order(ByteOrder.LITTLE_ENDIAN);
+            while (samples.hasRemaining()) samples.putFloat(.125f);
+            Path pcm = Files.write(work.resolve("six.f32"), samples.array());
+            String title = "夜曲:现场/混音";
+            Path named;
+            try (var cache = new StemCache(defaultCache, WindowsRecycle::recycle)) {
+                var entry = cache.publish(identity, title, 44100, frames, pcm, null, work, Long.MAX_VALUE, false);
+                named = entry.path();
+                require(named.getFileName().toString().startsWith("夜曲 现场 混音 - 标准分离 [")
+                        && cache.lookup(identity).path().equals(named), "readable filenames lost the lookup key");
+                cache.catalog(identity.digest(), title);
+            }
+
+            var otherName = new CacheFileName(null, CacheFileName.CURRENT_MODEL, true, "b".repeat(64));
+            Path conflict = Files.writeString(defaultCache.resolve(otherName.forTitle("原版本")), "original");
+            Path existing = Files.writeString(destination.resolve(otherName.forTitle("目标版本")), "existing");
+            Path oldStems = Files.writeString(defaultCache.resolve(otherName.key() + ".stems"), "unsupported");
+
+            try (var otherFs = FileSystems.newFileSystem(work.resolve("copy-target.zip"), Map.of("create", "true"))) {
+                Path copied = otherFs.getPath("/");
+                var copy = CacheDirectoryMigration.prepare(defaultCache, copied, new PythonEngine.Task((stage, progress) -> {}));
+                require(copy.transferred().size() == 2 && Files.isRegularFile(named)
+                        && Files.mismatch(named, copied.resolve(named.getFileName().toString())) == -1,
+                        "copying across filesystems failed before commit");
+            }
+
+            try (var session = new TrackMixSession(data, () -> null)) {
+                session.start();
+                var switched = changeDirectory(session, destination);
+                require(switched.success() && switched.message().contains("1 个")
+                        && session.cacheDirectory().equals(destination), "switch did not report the filename conflict");
+                require(!Files.exists(named) && Files.readString(conflict).equals("original")
+                        && Files.readString(existing).equals("existing") && Files.isRegularFile(oldStems),
+                        "migration lost a conflict or touched an unsupported file");
+                try (var cache = new StemCache(destination, data.resolve("codec"), WindowsRecycle::recycle)) {
+                    var entry = cache.lookup(identity);
+                    near(cache.readWindow(entry, 1, 3).samples()[0], .125f, "migrated PCM");
+                    require(cache.catalog(null, "").stream().anyMatch(track -> track.displayName().equals(title)),
+                            "the complete song title was lost during migration");
+                }
+                try (var reopened = new TrackMixSession(data, () -> null)) {
+                    require(reopened.cacheDirectory().equals(destination), "the selected cache directory was not saved");
+                }
+                var reset = changeDirectory(session, null);
+                require(reset.success() && session.cacheDirectory().equals(defaultCache) && Files.isRegularFile(named)
+                        && !Files.exists(destination.resolve(named.getFileName())),
+                        "reset did not migrate the cache back to the default directory");
+            }
+        } finally {
+            WindowsRecycle.recycle(work);
+        }
+    }
+
+    private static TrackMixJobs.Result changeDirectory(TrackMixSession session, Path directory) throws Exception {
+        var completion = new CompletableFuture<TrackMixJobs.Result>();
+        require(session.changeCacheDirectory(directory, completion::complete), "cache migration was not queued");
+        return completion.get(5, TimeUnit.SECONDS);
+    }
+
     private static void playbackSessionChecks() throws Exception {
         Path directory = Files.createTempDirectory("spw-track-mix-session-check-").toAbsolutePath().normalize();
         try {
@@ -293,8 +349,8 @@ final class PcmChecks {
             var selected = new AtomicReference<>(first);
             var cachedDigest = StemCache.Identity.read(secondPath).digest();
             Path cacheDir = Files.createDirectory(directory.resolve("cache"));
-            Path cached = Files.write(cacheDir.resolve("9abcdef0-" + cachedDigest + ".stems"), new byte[1536]);
-            Path orphan = Files.createFile(cacheDir.resolve("9abcdef0-quick-" + "a".repeat(64) + ".stems"));
+            Path cached = Files.write(cacheDir.resolve("9abcdef0-" + cachedDigest + ".jema"), new byte[1536]);
+            Path orphan = Files.createFile(cacheDir.resolve("9abcdef0-quick-" + "a".repeat(64) + ".jema"));
             Path assets = Files.createDirectory(directory.resolve("models"));
             Path model = Files.write(assets.resolve("BS-Rofo-SW-Fixed.ckpt.part"), new byte[32]);
             var mix = MixSettings.DEFAULT.withVolume(3, 65).withMuted(1).withSolo(3);
@@ -387,10 +443,17 @@ final class PcmChecks {
         server.invoke(name, "action", new Object[]{"fixture", context, "settings", 0}, edit);
         var settings = (List<?>) server.invoke(name, "render", new Object[]{"fixture", context}, render);
         require(findControl(settings, "text", "未就绪 · 32 B") != null
+                && findControl(settings, "action", "chooseCacheDirectory") != null
+                && findControl(settings, "action", "resetCacheDirectory") != null
                 && findControl(settings, "action", "deleteAll") == null,
                 "settings should show the model's disk usage and a single entry to manage the cache");
         server.invoke(name, "action", new Object[]{"fixture", context, "manageCache", 0}, edit);
         var cache = (List<?>) server.invoke(name, "render", new Object[]{"fixture", context}, render);
+        var buttons = findControl(cache, "id", "cache-actions");
+        require(buttons != null && Integer.valueOf(8).equals(buttons.get("gap"))
+                && findControl((List<?>) buttons.get("children"), "action", "backFromCache") != null
+                && findControl((List<?>) buttons.get("children"), "action", "deleteAll") != null,
+                "cache actions must share a row with spacing");
         require(findControl(cache, "text", "2 首 · 已占用 1.5 KiB") != null
                 && findControl(cache, "text", "标准分离 · 1.5 KiB") != null
                 && findControl(cache, "action", "delete." + cachedDigest) != null,
@@ -417,6 +480,10 @@ final class PcmChecks {
         require(findControl(empty, "text", "暂无缓存，已占用 0 B") != null && !Files.exists(orphan)
                 && Files.isRegularFile(track.path()) && Files.isRegularFile(model),
                 "deletion must update the total, preserve the source, and preserve the model");
+        require(findControl(empty, "id", "job-notice") != null, "the open panel did not show its completion");
+        var reopened = (List<?>) server.invoke(name, "render", new Object[]{"reopened", context}, render);
+        require(findControl(reopened, "id", "job-notice") == null, "a reopened panel showed an earlier completion");
+        server.invoke(name, "close", new Object[]{"reopened"}, new String[]{"java.lang.String"});
         server.invoke(name, "action", new Object[]{"fixture", context, "backFromCache", 0}, edit);
         server.invoke(name, "action", new Object[]{"fixture", context, "cacheGiB", preferences.cacheGiB()}, edit);
         server.invoke(name, "action", new Object[]{"fixture", context, "cpu", 0}, edit);
@@ -454,7 +521,8 @@ final class PcmChecks {
     private static void queueChecks() {
         var work = new ArrayDeque<Runnable>();
         var ran = new ArrayList<String>();
-        try (var jobs = new TrackMixJobs(work::addLast, () -> {})) {
+        var clock = new AtomicLong();
+        try (var jobs = new TrackMixJobs(work::addLast, () -> {}, clock::get)) {
             jobs.separate("First song", "a", false, task -> {
                 ran.add("a");
                 task.report("gpu32", .48);
@@ -495,6 +563,8 @@ final class PcmChecks {
             jobs.cancel(jobs.snapshot("a").items().getFirst().id());
             work.removeFirst().run();
             require(jobs.snapshot("a").notice().contains("已取消"), "active cancellation did not finish");
+            clock.set(TimeUnit.SECONDS.toNanos(8));
+            require(jobs.snapshot("a").notice().isEmpty(), "a job notice outlived its display duration");
         }
     }
 
