@@ -59,7 +59,7 @@ public final class TrackMixPlugin extends SpwPlugin {
             throw new IllegalStateException("找不到 Windows 本地应用数据目录");
         }
         var created = new TrackMixSession(Path.of(location, "SPW Track Mix").toAbsolutePath().normalize(),
-                TrackMixPlugin::currentTrack);
+                TrackMixPlugin::currentTrack, playbackSource());
         try {
             streamHook = WorkshopApi.hookRegistrar().hookMethod(BASS_BINDING, CREATE_FILE_STREAM,
                     List.of("java.lang.String", "long", "long", "int"), new MethodHook() {
@@ -97,6 +97,15 @@ public final class TrackMixPlugin extends SpwPlugin {
                 }
             }
             throw error;
+        }
+    }
+
+    private static TrackMixSession.PlaybackSource playbackSource() {
+        try {
+            return new HostPlaybackSource(WorkshopApi.class.getClassLoader())::current;
+        } catch (ReflectiveOperationException | LinkageError error) {
+            LOG.log(System.Logger.Level.WARNING, "Could not resolve the already-open SPW playback source", error);
+            return () -> null;
         }
     }
 

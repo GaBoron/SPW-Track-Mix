@@ -83,7 +83,9 @@ final class BassSourceDsp implements AutoCloseable {
             return false;
         }
 
-        Registration registration = new Registration(channel, path, format);
+        long position = library.sourceBytePosition(channel);
+        Registration registration = new Registration(channel, path, format,
+                (int) Math.clamp(position / format.frameBytes(), 0, format.frames() - 1));
         CALLBACKS.put(registration.context, registration);
         registrations.add(registration);
         try {
@@ -125,10 +127,11 @@ final class BassSourceDsp implements AutoCloseable {
         return null;
     }
 
-    boolean attached(Path path, StemCache.Entry entry) {
+    boolean ready(Path path, StemCache.Entry entry) {
+        if (entry == null) return false;
         for (Registration registration : forPrefetch) {
-            if (!registration.released && !registration.bypassed && registration.path.equals(path)
-                    && (entry == null || registration.format.matches(entry))) {
+            if (registration.selected == entry && registration.path.equals(path)
+                    && !registration.released && !registration.bypassed) {
                 return true;
             }
         }
@@ -171,25 +174,22 @@ final class BassSourceDsp implements AutoCloseable {
         private volatile StemCache.Entry selected;
         private volatile MixedSpectrum spectrum;
 
-        private Registration(int channel, Path path, AudioFormat format) {
+        private Registration(int channel, Path path, AudioFormat format, int decodedFrame) {
             this.channel = channel;
             this.path = path;
             this.format = format;
+            this.decodedFrame = decodedFrame;
             mixer = new RealtimeStemMixer(format.rate());
         }
 
         private void clearWindows() {
+            selected = null;
             window = null;
             openingWindow = null;
-            selected = null;
             spectrum = null;
         }
 
         private void loadWindow(StemCache.Entry entry) throws IOException {
-            if (selected != entry || spectrum == null) {
-                spectrum = new MixedSpectrum(entry.rate());
-            }
-            selected = entry;
             int frame = decodedFrame;
             int ahead = usableAhead(entry, frame);
             if (covers(openingWindow, entry, frame, ahead)) {
@@ -201,6 +201,10 @@ final class BassSourceDsp implements AutoCloseable {
                 openingWindow = frame == 0 && covers(window, entry, 0, ahead) ? window
                         : cache.readWindow(entry, 0,
                                 Math.min(entry.frames(), Math.min(entry.rate(), StemCache.MAX_WINDOW_FRAMES)));
+            }
+            if (selected != entry) {
+                spectrum = new MixedSpectrum(entry.rate());
+                selected = entry;
             }
         }
 

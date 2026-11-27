@@ -38,6 +38,7 @@ final class BassChecks {
         Path resources = Path.of(args[0]).toAbsolutePath();
         Path fixture = Path.of(args[1]).toAbsolutePath();
         Path workspace = Files.createTempDirectory("spw-track-mix-bass-check-").toAbsolutePath().normalize();
+        System.setProperty("compose.application.resources.dir", resources.toString());
         try (var arena = Arena.ofShared();
              var cache = new StemCache(workspace.resolve("cache"), WindowsRecycle::recycle)) {
             var bassPath = resources.resolve("bass.dll");
@@ -55,6 +56,7 @@ final class BassChecks {
                 var entry = fixtureCache(cache, fixture, workspace);
                 exercise(bass, mixer, library, fixture, cache, entry, arena, FLOAT, 8);
                 exercise(bass, mixer, library, fixture, cache, entry, arena, 0, 4);
+                exerciseLateCache(bass, mixer, fixture, workspace, arena);
                 exerciseConcurrentDetach(bass, mixer, library, fixture, cache, entry);
             } finally {
                 var free = bind(bass, "BASS_Free", JAVA_INT);
@@ -63,7 +65,7 @@ final class BassChecks {
         } finally {
             WindowsRecycle.recycle(workspace);
         }
-        System.out.println("Native BASS verified: decode, float and PCM16 DSP, pause, seek recovery, loop, source change and concurrent detach.");
+        System.out.println("Native BASS verified: late cache on an already-open stream, float and PCM16 DSP, pause, seek recovery, loop and concurrent detach.");
     }
 
     private static StemCache.Entry fixtureCache(StemCache cache, Path fixture, Path work) throws Exception {
@@ -168,6 +170,71 @@ final class BassChecks {
         require((int) free.invokeExact(mix) != 0, "test mixer could not be freed");
     }
 
+    private static void exerciseLateCache(SymbolLookup bass, SymbolLookup mixer, Path fixture, Path work, Arena arena)
+            throws Throwable {
+        var create = bind(bass, "BASS_StreamCreateFile", JAVA_INT, JAVA_INT, ADDRESS,
+                JAVA_LONG, JAVA_LONG, JAVA_INT);
+        var createMixer = bind(mixer, "BASS_Mixer_StreamCreate", JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT);
+        var add = bind(mixer, "BASS_Mixer_StreamAddChannel", JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT);
+        var seek = bind(mixer, "BASS_Mixer_ChannelSetPosition", JAVA_INT, JAVA_INT, JAVA_LONG, JAVA_INT);
+        var read = bind(bass, "BASS_ChannelGetData", JAVA_INT, JAVA_INT, ADDRESS, JAVA_INT);
+        var free = bind(bass, "BASS_StreamFree", JAVA_INT, JAVA_INT);
+
+        var name = arena.allocateFrom(fixture.toString(), StandardCharsets.UTF_16LE);
+        int stream = (int) create.invokeExact(0, name, 0L, 0L, UNICODE | DECODE | FLOAT);
+        int output = (int) createMixer.invokeExact(44100, 2, DECODE | FLOAT);
+        require(stream != 0 && output != 0, "BASS could not open the late-cache fixture");
+        try {
+            require((int) add.invokeExact(output, stream, NO_RAMP) != 0, "late-cache source was not mixed");
+            int start = 142_813;
+            seek(seek, stream, start, 8);
+            var pcm = arena.allocate(FRAMES * 8, 8);
+            pull(read, output, pcm);
+            check(pcm, start, 0, -1);
+
+            Path data = work.resolve("late-cache");
+            var track = new TrackMixSession.Track(fixture, "Already-open track", "late-cache");
+            var source = new TrackMixSession.Source(fixture, stream);
+            var currentSource = new AtomicReference<>(new TrackMixSession.Source(work.resolve("other.wav"), stream));
+            try (var session = new TrackMixSession(data, () -> track, currentSource::get);
+                 var cache = new StemCache(data.resolve("cache"), WindowsRecycle::recycle)) {
+                session.start();
+                awaitSession(session, false);
+                var selection = session.status().selection();
+                require(selection.entry() == null, "late-cache fixture unexpectedly started with stems");
+                var entry = fixtureCache(cache, fixture, work);
+                session.cachePublished(selection.identity(), entry);
+                require(!session.status().ready(), "cache became ready on another track's source");
+                pull(read, output, pcm);
+                check(pcm, start + FRAMES, 0, -1);
+
+                currentSource.set(source);
+                awaitSession(session, true);
+                require(session.status().selection().entry() == entry, "current cache was replaced during activation");
+                pull(read, output, pcm);
+                check(pcm, start + 2 * FRAMES, 0, -1);
+                session.setMix(mix -> mix.withPreset(MixSettings.Preset.VOCALS));
+                pull(read, output, pcm);
+                check(pcm, start + 3 * FRAMES, 500, 0, entry.loudness().gainFor(session.status().mix()));
+            }
+        } finally {
+            require((int) free.invokeExact(stream) != 0, "late-cache source could not be freed");
+            require((int) free.invokeExact(output) != 0, "late-cache mixer could not be freed");
+        }
+    }
+
+    private static void awaitSession(TrackMixSession session, boolean ready) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (System.nanoTime() < deadline) {
+            var status = session.status();
+            if (status.selection() != null && status.selection().identity() != null && status.ready() == ready) {
+                return;
+            }
+            Thread.sleep(10);
+        }
+        throw new AssertionError("Session failed to reach ready=" + ready + ": " + session.status());
+    }
+
     private static void exerciseConcurrentDetach(SymbolLookup bass, SymbolLookup mixer, BassLibrary library, Path fixture,
                                                  StemCache stemCache, StemCache.Entry cache) throws Throwable {
         var create = bind(bass, "BASS_StreamCreateFile", JAVA_INT, JAVA_INT, ADDRESS,
@@ -231,7 +298,7 @@ final class BassChecks {
                     if (failure.get() != null) {
                         throw failure.get();
                     }
-                    require(!effects.attached(fixture, cache), "retired DSP still reported attached");
+                    require(!effects.ready(fixture, cache), "retired DSP still reported ready");
                     pull(read, output, pcm);
                     check(pcm, FRAMES, 0, -1);
                 } finally {

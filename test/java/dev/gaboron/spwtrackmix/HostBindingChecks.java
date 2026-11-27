@@ -17,7 +17,7 @@ final class HostBindingChecks {
         var factory = Class.forName("com.moriafly.bass.BASS", false, loader)
                 .getDeclaredMethod("\u037f", signature.parameterArray());
         PcmChecks.require(factory.getReturnType() == int.class, "BASS source factory changed");
-
+        new HostPlaybackSource(loader);
 
         try (var archive = new ZipFile(args[0]);
              var session = new TrackMixSession(Path.of(args[0]).getParent().resolve("unused-track-mix-check"), () -> null);
@@ -63,6 +63,6 @@ final class HostBindingChecks {
                     new String[]{"java.lang.String", "long"}) == null, "no source must report no mixed spectrum");
         }
         PcmChecks.require(!server.isRegistered(name), "AMLL mixer bridge remains registered");
-        System.out.println("Installed SPW bindings verified: file-source DSP, menu, theme, dialog and AMLL endpoint.");
+        System.out.println("Installed SPW bindings verified: file and active sources, menu, theme, dialog and AMLL endpoint.");
     }
 }

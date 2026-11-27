@@ -22,7 +22,14 @@ final class TrackMixSession implements AutoCloseable {
     }
 
     record Selection(Track track, StemCache.Identity identity, StemCache.Entry entry, String error) {}
-    record Status(Selection selection, MixSettings mix, boolean attached, TrackMixJobs.Snapshot queue,
+    record Source(Path path, int channel) {}
+
+    @FunctionalInterface
+    interface PlaybackSource {
+        Source current() throws ReflectiveOperationException;
+    }
+
+    record Status(Selection selection, MixSettings mix, boolean ready, TrackMixJobs.Snapshot queue,
                   String notice, long cacheBytes, boolean modelReady, long modelBytes) {
         boolean canSeparate() {
             return !queue.currentQueued() && selection != null && selection.identity != null
@@ -47,6 +54,7 @@ final class TrackMixSession implements AutoCloseable {
     private final Path data;
     private final Path config;
     private final Supplier<Track> currentTrack;
+    private final PlaybackSource playbackSource;
     private final StemCache cache;
     private final PythonEngine engine;
     private final ScheduledExecutorService monitor = Executors.newSingleThreadScheduledExecutor(
@@ -68,13 +76,18 @@ final class TrackMixSession implements AutoCloseable {
     private volatile CacheCatalog catalog;
     private volatile String removingDigest;
     private volatile String notice = "";
-    private long seenCacheRevision = -1;
+    private volatile long seenCacheRevision = -1;
     private volatile BassSourceDsp effects;
     private BassLibrary bass;
 
     TrackMixSession(Path data, Supplier<Track> currentTrack) {
+        this(data, currentTrack, () -> null);
+    }
+
+    TrackMixSession(Path data, Supplier<Track> currentTrack, PlaybackSource playbackSource) {
         this.data = data;
         this.currentTrack = currentTrack;
+        this.playbackSource = playbackSource;
         config = data.resolve("settings.properties");
         options = saved = TrackMixOptions.read(config);
         cache = new StemCache(data.resolve("cache"), WindowsRecycle::recycle);
@@ -87,22 +100,37 @@ final class TrackMixSession implements AutoCloseable {
         worker.execute(this::enforceLimit);
     }
 
-    synchronized void sourceOpened(int channel, String path) {
-        if (closed) {
+    void sourceOpened(int channel, String path) {
+        try {
+            Path source = Path.of(path);
+            if (source.isAbsolute()) {
+                attachSource(channel, source.normalize());
+            }
+        } catch (Throwable error) {
+            LOG.log(System.Logger.Level.WARNING, "Track Mix left an unsupported source untouched", error);
+        }
+    }
+
+    private synchronized void attachSource(int channel, Path path) throws Throwable {
+        if (closed) return;
+        if (effects == null) {
+            effects = new BassSourceDsp(bass(), cache, this::mixFor, () -> playback.entry());
+        }
+        effects.attach(channel, path);
+    }
+
+    private void recoverPlaybackSource() {
+        var current = playback.selection;
+        if (closed || current == null || current.entry == null) {
             return;
         }
         try {
-            Path source = Path.of(path);
-            if (!source.isAbsolute()) {
-                return;
+            var source = playbackSource.current();
+            if (source != null && source.path.equals(current.track.path) && playback.selection == current) {
+                attachSource(source.channel, source.path);
             }
-            refreshSelection();
-            if (effects == null) {
-                effects = new BassSourceDsp(bass(), cache, this::mixFor, () -> playback.entry());
-            }
-            effects.attach(channel, source.normalize());
         } catch (Throwable error) {
-            LOG.log(System.Logger.Level.WARNING, "Track Mix left an unsupported source untouched", error);
+            LOG.log(System.Logger.Level.WARNING, "Track Mix could not attach to the already-open source", error);
         }
     }
 
@@ -124,7 +152,7 @@ final class TrackMixSession implements AutoCloseable {
         var queue = jobs.snapshot(selected == null || selected.identity == null ? null : selected.identity.digest());
         var storage = catalog;
         return new Status(selected, current.mix, selected != null && active != null
-                && active.attached(selected.track.path, selected.entry), queue, notice,
+                && active.ready(selected.track.path, selected.entry), queue, notice,
                 storage == null ? 0 : storage.bytes, modelReady, modelBytes);
     }
 
@@ -226,6 +254,7 @@ final class TrackMixSession implements AutoCloseable {
                 return "音轨缓存已移入回收站";
             } finally {
                 removingDigest = null;
+                cacheRevision.incrementAndGet();
             }
         });
     }
@@ -248,14 +277,16 @@ final class TrackMixSession implements AutoCloseable {
             engine.separate(task, input, output, format.rate(), parameters, quick);
             task.check();
             task.report("cache", 0);
-            var entry = cache.publish(selected.identity, format.rate(), format.frames(), output, input, staging,
-                    options.cacheBytes(), quick);
-            refreshCatalog(selected.identity.digest(), selected.track.title);
-            var current = playback.selection;
-            if (current != null && current.identity != null
-                    && current.identity.digest().equals(selected.identity.digest())) {
-                publishSelection(current, new Selection(current.track, current.identity, entry, ""));
+            StemCache.Entry entry;
+            try {
+                entry = cache.publish(selected.identity, format.rate(), format.frames(), output, input, staging,
+                        options.cacheBytes(), quick);
+            } catch (IOException error) {
+                cacheRevision.incrementAndGet();
+                throw error;
             }
+            cachePublished(selected.identity, entry);
+            refreshCatalog(selected.identity.digest(), selected.track.title);
             return quick ? "快速分离已完成" : "标准分离已完成";
         } finally {
             Thread.interrupted();
@@ -267,6 +298,17 @@ final class TrackMixSession implements AutoCloseable {
                 }
             }
         }
+    }
+
+    void cachePublished(StemCache.Identity identity, StemCache.Entry entry) {
+        synchronized (playbackLock) {
+            long revision = cacheRevision.incrementAndGet();
+            var current = refreshSelection();
+            if (current != null && identity.equals(current.identity)) {
+                publishCacheSelection(current, new Selection(current.track, identity, entry, ""), revision);
+            }
+        }
+        recoverPlaybackSource();
     }
 
     void cancel(int id) {
@@ -297,6 +339,14 @@ final class TrackMixSession implements AutoCloseable {
                 return false;
             }
             playback = new Playback(updated, playback.mix);
+            return true;
+        }
+    }
+
+    private boolean publishCacheSelection(Selection previous, Selection updated, long revision) {
+        synchronized (playbackLock) {
+            if (revision != cacheRevision.get() || !publishSelection(previous, updated)) return false;
+            seenCacheRevision = revision;
             return true;
         }
     }
@@ -334,14 +384,15 @@ final class TrackMixSession implements AutoCloseable {
             } catch (IOException error) {
                 result = new Selection(track, identity, null, display(error));
             }
-            if (revision == cacheRevision.get() && publishSelection(selected, result)) {
-                seenCacheRevision = revision;
+            if (publishCacheSelection(selected, result, revision)) {
                 rememberLegacyTitle(identity.digest(), track.title);
             }
         } catch (Exception error) {
             if (selected != null) {
                 publishSelection(selected, new Selection(selected.track, null, null, display(error)));
             }
+        } finally {
+            recoverPlaybackSource();
         }
     }
 
@@ -378,7 +429,11 @@ final class TrackMixSession implements AutoCloseable {
             // Drop published windows before any eviction.
             if (cache.size() > options.cacheBytes()) {
                 bypassCurrent("");
-                cache.evict(options.cacheBytes(), null);
+                try {
+                    cache.evict(options.cacheBytes(), null);
+                } finally {
+                    cacheRevision.incrementAndGet();
+                }
             }
         } catch (IOException error) {
             notice = display(error);
@@ -413,7 +468,6 @@ final class TrackMixSession implements AutoCloseable {
         modelReady = engine.hasModel();
         modelBytes = engine.modelBytes();
         refreshCatalog(null, "");
-        cacheRevision.incrementAndGet();
     }
 
     private void refreshCatalog(String digest, String title) {

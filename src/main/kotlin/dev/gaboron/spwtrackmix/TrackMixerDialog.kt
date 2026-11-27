@@ -107,7 +107,7 @@ private fun MixerBody(session: TrackMixSession, state: TrackMixSession.Status, m
                       update: () -> Unit, manage: () -> Unit) {
     val current = state.selection()
     val cached = current?.entry() != null
-    val ready = cached && state.attached()
+    val ready = state.ready()
     val quickCached = current?.entry()?.quick() == true
     Text(current?.track()?.title() ?: "当前歌曲", style = SaltTheme.textStyles.main,
         maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -117,7 +117,7 @@ private fun MixerBody(session: TrackMixSession, state: TrackMixSession.Status, m
         ready && quickCached -> if (mix.original()) "快速分离已缓存 · 原曲直通" else "快速分离 · 实时混音"
         ready && mix.original() -> "六轨已缓存 · 原曲直通"
         ready -> "六轨已缓存 · 实时混音"
-        cached -> "六轨已缓存 · 重新打开这首歌以接入混音"
+        cached -> "六轨已缓存 · 当前播放暂未接入混音"
         state.queue().currentQueued() -> "原曲直通 · 已加入分离队列"
         else -> "原曲直通 · 当前歌曲尚无六轨缓存"
     }

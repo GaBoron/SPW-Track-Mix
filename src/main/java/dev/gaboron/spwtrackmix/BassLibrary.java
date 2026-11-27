@@ -167,6 +167,10 @@ final class BassLibrary {
         return (long) channelPosition.invokeExact(channel, POS_DSP);
     }
 
+    long sourceBytePosition(int channel) throws Throwable {
+        return (long) channelPosition.invokeExact(channel, 0);
+    }
+
     int addDsp(int channel, MemorySegment function, MemorySegment context) throws Throwable {
         return (int) addDsp.invokeExact(channel, function, context, 100, DSP_FREECALL | DSP_FLOAT);
     }

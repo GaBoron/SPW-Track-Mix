@@ -103,7 +103,7 @@ public final class TrackMixLink implements AutoCloseable {
                     Map.entry("trackId", selection == null ? "" : selection.track().id()),
                     Map.entry("trackPath", selection == null ? "" : selection.track().path().toString()),
                     Map.entry("cached", cached),
-                    Map.entry("ready", cached && state.attached()),
+                    Map.entry("ready", state.ready()),
                     Map.entry("canSeparate", state.canSeparate()),
                     Map.entry("canQuick", state.canQuickSeparate()),
                     Map.entry("currentQueued", state.queue().currentQueued()),

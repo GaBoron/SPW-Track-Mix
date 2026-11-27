@@ -56,7 +56,7 @@ final class TrackMixPanel implements AmllPlayerRegistration.Panel {
             settings(controls, draft, status);
         }
         queue(controls, status.queue());
-        if (draft == null && track != null && track.entry() != null && status.attached()) {
+        if (draft == null && track != null && status.ready()) {
             faders(controls, status.mix());
         }
         return controls;
@@ -81,11 +81,11 @@ final class TrackMixPanel implements AmllPlayerRegistration.Panel {
             description = track.error();
         } else if (!status.notice().isBlank()) {
             description = status.notice();
-        } else if (track.entry() != null && status.attached()) {
+        } else if (status.ready()) {
             String playback = status.mix().original() ? "原曲直通" : "实时混音";
             description = track.entry().quick() ? "快速分离 · " + playback : playback;
         } else if (track.entry() != null) {
-            description = "重新打开歌曲以接入混音";
+            description = "六轨已缓存 · 当前播放暂未接入混音";
         } else {
             description = status.queue().currentQueued() ? "已加入分离队列" : "这首歌尚未分离";
         }
@@ -283,7 +283,7 @@ final class TrackMixPanel implements AmllPlayerRegistration.Panel {
             session.separate(track.track(), false);
         } else if (action.equals("quick") && status.canQuickSeparate()) {
             session.separate(track.track(), true);
-        } else if (track.entry() != null && status.attached()) {
+        } else if (status.ready()) {
             editFaders(track.track(), action, value);
         }
     }
